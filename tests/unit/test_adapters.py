@@ -1,6 +1,6 @@
 from collections.abc import AsyncGenerator
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -303,3 +303,68 @@ async def test_openai_client_generate_stream_invalid_json(
         chunks.append(chunk)
 
     assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_client_forwards_anthropic_beta() -> None:
+    client = AnthropicClient(api_key="test-key", base_url="https://api.anthropic.com")
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+
+        async def aiter_lines() -> AsyncGenerator[str, None]:
+            yield (
+                'data: {"type": "content_block_delta", "delta": '
+                '{"type": "text_delta", "text": "ok"}}'
+            )
+
+        mock_resp.aiter_lines = aiter_lines
+        mock_stream.return_value.__aenter__.return_value = mock_resp
+
+        chunks = []
+        async for c in client.generate_stream(
+            "claude-3-5-sonnet",
+            [{"role": "user", "content": "hi"}],
+            anthropic_beta="prompt-caching-2024-07-31",
+        ):
+            chunks.append(c)
+
+        _, kwargs = mock_stream.call_args
+        assert "anthropic-beta" in kwargs["headers"]
+        assert kwargs["headers"]["anthropic-beta"] == "prompt-caching-2024-07-31"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_client_thinking_and_partial_json() -> None:
+    client = AnthropicClient(api_key="test-key", base_url="https://api.anthropic.com")
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+
+        async def aiter_lines() -> AsyncGenerator[str, None]:
+            yield (
+                'data: {"type": "content_block_delta", "delta": '
+                '{"type": "thinking_delta", "thinking": "Let me think."}}'
+            )
+            yield (
+                'data: {"type": "content_block_delta", "delta": '
+                '{"type": "input_json_delta", "partial_json": "{\\"arg\\": 1}"}}'
+            )
+            yield (
+                'data: {"type": "content_block_delta", "delta": '
+                '{"type": "text_delta", "text": "Done"}}'
+            )
+
+        mock_resp.aiter_lines = aiter_lines
+        mock_stream.return_value.__aenter__.return_value = mock_resp
+
+        chunks = []
+        async for c in client.generate_stream(
+            "claude-3-5-sonnet",
+            [{"role": "user", "content": "hi"}],
+        ):
+            chunks.append(c)
+
+        assert "Let me think." in chunks
+        assert '{"arg": 1}' in chunks
+        assert "Done" in chunks

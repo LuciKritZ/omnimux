@@ -3,17 +3,24 @@ from collections.abc import AsyncGenerator, Generator
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import aiosqlite
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from omnimux.app import create_app
-from omnimux.models.schemas import (
-    AnthropicMessage,
-    AnthropicMessagesRequest,
-    convert_anthropic_to_chat_completion,
-)
-from omnimux.services.adapters import AnthropicClient
+from omnimux.routes.proxy import verify_auth
+from omnimux.services.db import create_client_key, init_db
+
+
+@pytest_asyncio.fixture
+async def memory_db() -> AsyncGenerator[aiosqlite.Connection, None]:
+    async with aiosqlite.connect(":memory:") as db:
+        await init_db(db)
+        yield db
 
 
 @pytest.fixture
@@ -27,9 +34,7 @@ def test_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, 
         yield client
 
 
-def test_reproduce_stream_false_chat_completions(test_client: TestClient) -> None:
-    # Task 1: /v1/chat/completions with stream=False must return application/json chat.completion,
-    # not text/event-stream StreamingResponse
+def test_chat_completions_stream_false_returns_json(test_client: TestClient) -> None:
     with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
 
         async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
@@ -55,28 +60,7 @@ def test_reproduce_stream_false_chat_completions(test_client: TestClient) -> Non
         assert data["choices"][0]["finish_reason"] == "stop"
 
 
-def test_reproduce_convert_anthropic_preserves_tools_and_top_p() -> None:
-    # Task 2: convert_anthropic_to_chat_completion must preserve tools and top_p
-    tools = [
-        {
-            "name": "get_weather",
-            "description": "Get current weather",
-            "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}},
-        }
-    ]
-    req = AnthropicMessagesRequest(
-        model="claude-3-5-sonnet",
-        messages=[AnthropicMessage(role="user", content="What's the weather?")],
-        tools=tools,
-        top_p=0.9,
-    )
-    converted = convert_anthropic_to_chat_completion(req)
-    assert getattr(converted, "tools", None) == tools
-    assert getattr(converted, "top_p", None) == 0.9
-
-
-def test_reproduce_openai_sse_chunk_has_index(test_client: TestClient) -> None:
-    # Task 3: OpenAI SSE chunks must include "index": 0 in choices
+def test_openai_sse_chunk_has_index(test_client: TestClient) -> None:
     with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
 
         async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
@@ -104,75 +88,7 @@ def test_reproduce_openai_sse_chunk_has_index(test_client: TestClient) -> None:
         assert chunk_data["choices"][0]["index"] == 0
 
 
-@pytest.mark.asyncio
-async def test_reproduce_anthropic_client_forwards_anthropic_beta() -> None:
-    # Task 4: AnthropicClient forwards anthropic-beta header
-    client = AnthropicClient("https://api.anthropic.com", "test-key")
-    with patch("httpx.AsyncClient.stream") as mock_stream:
-        mock_resp = AsyncMock()
-        mock_resp.status_code = 200
-
-        async def aiter_lines() -> AsyncGenerator[str, None]:
-            yield (
-                'data: {"type": "content_block_delta", "delta": '
-                '{"type": "text_delta", "text": "ok"}}'
-            )
-
-        mock_resp.aiter_lines = aiter_lines
-        mock_stream.return_value.__aenter__.return_value = mock_resp
-
-        chunks = []
-        async for c in client.generate_stream(
-            "claude-3-5-sonnet",
-            [{"role": "user", "content": "hi"}],
-            anthropic_beta="prompt-caching-2024-07-31",
-        ):
-            chunks.append(c)
-
-        _, kwargs = mock_stream.call_args
-        assert "anthropic-beta" in kwargs["headers"]
-        assert kwargs["headers"]["anthropic-beta"] == "prompt-caching-2024-07-31"
-
-
-@pytest.mark.asyncio
-async def test_reproduce_anthropic_client_thinking_and_partial_json() -> None:
-    # Task 5: AnthropicClient yields thinking_delta and partial_json
-    client = AnthropicClient("https://api.anthropic.com", "test-key")
-    with patch("httpx.AsyncClient.stream") as mock_stream:
-        mock_resp = AsyncMock()
-        mock_resp.status_code = 200
-
-        async def aiter_lines() -> AsyncGenerator[str, None]:
-            yield (
-                'data: {"type": "content_block_delta", "delta": '
-                '{"type": "thinking_delta", "thinking": "Let me think."}}'
-            )
-            yield (
-                'data: {"type": "content_block_delta", "delta": '
-                '{"type": "input_json_delta", "partial_json": "{\\"arg\\": 1}"}}'
-            )
-            yield (
-                'data: {"type": "content_block_delta", "delta": '
-                '{"type": "text_delta", "text": "Done"}}'
-            )
-
-        mock_resp.aiter_lines = aiter_lines
-        mock_stream.return_value.__aenter__.return_value = mock_resp
-
-        chunks = []
-        async for c in client.generate_stream(
-            "claude-3-5-sonnet",
-            [{"role": "user", "content": "hi"}],
-        ):
-            chunks.append(c)
-
-        assert "Let me think." in chunks
-        assert '{"arg": 1}' in chunks
-        assert "Done" in chunks
-
-
-def test_reproduce_non_data_image_url_preserved(test_client: TestClient) -> None:
-    # Task 6: Non-data image URLs (http://, https://) should not become [Image: unknown_image]
+def test_non_data_image_url_preserved(test_client: TestClient) -> None:
     with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
         captured_messages = []
 
@@ -186,7 +102,6 @@ def test_reproduce_non_data_image_url_preserved(test_client: TestClient) -> None
 
         mock_stream.side_effect = mock_gen
 
-        # Historical message with web image URL
         res = test_client.post(
             "/v1/chat/completions",
             json={
@@ -208,13 +123,11 @@ def test_reproduce_non_data_image_url_preserved(test_client: TestClient) -> None
             },
         )
         assert res.status_code == 200
-        # Historical message image should not be "unknown_image"
         first_content = str(captured_messages[0]["content"])
         assert "unknown_image" not in first_content
 
 
-def test_reproduce_count_tokens_includes_system_and_tools(test_client: TestClient) -> None:
-    # Task 7: /v1/messages/count_tokens must factor in system prompt and tools
+def test_count_tokens_includes_tools(test_client: TestClient) -> None:
     res_base = test_client.post(
         "/v1/messages/count_tokens",
         json={
@@ -243,7 +156,6 @@ def test_reproduce_count_tokens_includes_system_and_tools(test_client: TestClien
 
 
 def test_anthropic_messages_endpoint_forwards_beta_header(test_client: TestClient) -> None:
-    # Verify /v1/messages forwards anthropic-beta header to extra_kwargs
     with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
         captured_kwargs: dict[str, Any] = {}
 
@@ -268,3 +180,37 @@ def test_anthropic_messages_endpoint_forwards_beta_header(test_client: TestClien
         )
         assert res.status_code == 200
         assert captured_kwargs.get("anthropic_beta") == "prompt-caching-2024-07-31"
+
+
+@pytest.mark.asyncio
+async def test_auth_rejects_invalid_token_when_no_active_keys(
+    memory_db: aiosqlite.Connection,
+) -> None:
+    scope = {
+        "type": "http",
+        "headers": [(b"x-api-key", b"invalid-dummy-key")],
+        "app": type("App", (), {"state": type("State", (), {"db": memory_db})()})(),
+    }
+    req = Request(scope)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await verify_auth(req, credentials=None)
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_auth_rejects_missing_token_when_active_keys_exist(
+    memory_db: aiosqlite.Connection,
+) -> None:
+    await create_client_key(memory_db, "key1")
+    scope = {
+        "type": "http",
+        "headers": [],
+        "app": type("App", (), {"state": type("State", (), {"db": memory_db})()})(),
+    }
+    req = Request(scope)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await verify_auth(req, credentials=None)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Invalid or missing Bearer token"

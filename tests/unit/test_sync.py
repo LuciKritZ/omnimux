@@ -110,3 +110,34 @@ async def test_sync_keys_from_json_invalid_types(
         count = await cursor.fetchone()
         assert count is not None
         assert count[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_keys_preserves_existing_db_keys(
+    memory_db: aiosqlite.Connection,
+) -> None:
+    await memory_db.execute(
+        """
+        INSERT INTO api_keys (platform, key_hash, key_value, priority, meta)
+        VALUES ('gemini', 'hash-existing-1', 'gemini-key-val', 1, '{}')
+        """
+    )
+    await memory_db.commit()
+
+    payload = {
+        "keys": {"openrouter": [{"key_value": "new-openrouter-key", "priority": 1, "meta": {}}]}
+    }
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        json.dump(payload, f)
+        temp_name = f.name
+
+    try:
+        await sync_keys_from_json(memory_db, temp_name)
+    finally:
+        os.remove(temp_name)
+
+    async with memory_db.execute("SELECT platform FROM api_keys ORDER BY platform") as cursor:
+        rows = list(await cursor.fetchall())
+        platforms = [r[0] for r in rows]
+        assert "gemini" in platforms
+        assert "openrouter" in platforms

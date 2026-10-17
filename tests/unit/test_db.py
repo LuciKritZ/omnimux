@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -180,3 +181,64 @@ async def test_auto_import_from_json_if_empty(
 
     # 3. Running again when DB is not empty skips import
     await auto_import_from_json_if_empty(memory_db, str(json_path))
+
+
+@pytest.mark.asyncio
+async def test_keyless_platform_hash_uniqueness(memory_db: aiosqlite.Connection) -> None:
+    def get_hash(platform: str, key: str) -> str:
+        return hashlib.sha256(f"{platform}:{key}".encode()).hexdigest()
+
+    ollama_hash = get_hash("ollama", "")
+    vllm_hash = get_hash("vllm", "")
+
+    assert ollama_hash != vllm_hash
+
+    await memory_db.execute(
+        "INSERT INTO api_keys (platform, key_hash, key_value, priority) VALUES (?, ?, ?, 1)",
+        ("ollama", ollama_hash, ""),
+    )
+    await memory_db.execute(
+        "INSERT INTO api_keys (platform, key_hash, key_value, priority) VALUES (?, ?, ?, 1)",
+        ("vllm", vllm_hash, ""),
+    )
+    await memory_db.commit()
+
+    async with memory_db.execute("SELECT COUNT(*) FROM api_keys") as cursor:
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_platforms_without_models_visible(memory_db: aiosqlite.Connection) -> None:
+    await save_platform_and_models(
+        memory_db,
+        platform="openrouter",
+        api_base="https://openrouter.ai/api",
+        protocol="openai",
+        models_list=[],
+    )
+
+    platforms_data = await get_all_platforms_and_models(memory_db)
+    assert "openrouter" in platforms_data
+    assert platforms_data["openrouter"]["apiBase"] == "https://openrouter.ai/api"
+    async with memory_db.execute("SELECT name, api_base FROM platforms") as cursor:
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_revoke_client_key_escapes_wildcards(memory_db: aiosqlite.Connection) -> None:
+    _, info1 = await create_client_key(memory_db, "key1")
+    _, _info2 = await create_client_key(memory_db, "key2")
+
+    id1 = info1["prefix"][:8]
+    await revoke_client_key(memory_db, id1)
+
+    async with memory_db.execute(
+        "SELECT name, revoked_at FROM client_keys ORDER BY name"
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+        assert rows[0][1] is not None
+        assert rows[1][1] is None

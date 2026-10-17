@@ -1,4 +1,9 @@
-from omnimux.models.schemas import ChatCompletionRequest
+from omnimux.models.schemas import (
+    AnthropicMessage,
+    AnthropicMessagesRequest,
+    ChatCompletionRequest,
+    convert_anthropic_to_chat_completion,
+)
 
 
 def test_chat_completion_request_text() -> None:
@@ -40,12 +45,6 @@ def test_chat_completion_extra_fields_preserved() -> None:
 
 
 def test_convert_anthropic_to_chat_completion() -> None:
-    from omnimux.models.schemas import (
-        AnthropicMessage,
-        AnthropicMessagesRequest,
-        convert_anthropic_to_chat_completion,
-    )
-
     # 1. System as list of blocks, content with mixed blocks and non-dict items
     req = AnthropicMessagesRequest(
         model="claude-3-5-sonnet",
@@ -74,3 +73,22 @@ def test_convert_anthropic_to_chat_completion() -> None:
     assert chat_req.messages[0].content == "Be helpful."
     assert "hello" in str(chat_req.messages[1].content)
     assert chat_req.messages[2].content == "plain string"
+
+
+def test_convert_anthropic_preserves_tools_and_top_p() -> None:
+    tools = [
+        {
+            "name": "get_weather",
+            "description": "Get current weather",
+            "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}},
+        }
+    ]
+    req = AnthropicMessagesRequest(
+        model="claude-3-5-sonnet",
+        messages=[AnthropicMessage(role="user", content="What's the weather?")],
+        tools=tools,
+        top_p=0.9,
+    )
+    converted = convert_anthropic_to_chat_completion(req)
+    assert getattr(converted, "tools", None) == tools
+    assert getattr(converted, "top_p", None) == 0.9

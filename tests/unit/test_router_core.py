@@ -201,3 +201,24 @@ async def test_second_pass_cooldown(memory_db: aiosqlite.Connection) -> None:
     assert key["key_hash"] == "hash2"
 
     await task
+
+
+@pytest.mark.asyncio
+async def test_standardized_iso_timestamps(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    await memory_db.execute(
+        """
+        INSERT INTO api_keys (platform, key_hash, key_value, priority)
+        VALUES ('openrouter', 'h1', 'k1', 10)
+        """
+    )
+    await memory_db.commit()
+
+    platform, key = await router.get_best_platform_and_key(["openrouter"])
+    assert platform == "openrouter"
+    assert key["key_hash"] == "h1"
+    async with memory_db.execute("SELECT last_used_at FROM api_keys WHERE key_hash = 'h1'") as cur:
+        row = await cur.fetchone()
+        assert row is not None
+        ts = row[0]
+        assert "T" in ts, f"Timestamp {ts} must be ISO format with T for proper SQLite ordering"
