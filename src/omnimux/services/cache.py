@@ -23,6 +23,9 @@ class ImageCache:
 
     def store(self, image_hash: str, raw_bytes: bytes) -> Path:
         """Stores the image to disk. If cache exceeds limit, offloads oldest files."""
+        existing = self.get_path(image_hash)
+        if existing is not None:
+            return existing
         self.offload_if_needed()
         file_path = self.cache_dir / image_hash
         try:

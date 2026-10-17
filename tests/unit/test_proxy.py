@@ -214,3 +214,37 @@ async def test_auth_rejects_missing_token_when_active_keys_exist(
         await verify_auth(req, credentials=None)
     assert exc_info.value.status_code == 401
     assert exc_info.value.detail == "Invalid or missing Bearer token"
+
+
+def test_proxy_image_cache_wires_get_path_for_historical_images(test_client: TestClient) -> None:
+    with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
+
+        async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            yield "result"
+
+        mock_stream.return_value = mock_gen()
+
+        with patch("omnimux.services.cache.ImageCache.get_path") as mock_get_path:
+            res = test_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": f"[Image: {'a' * 64}] followup question",
+                        },
+                    ],
+                },
+            )
+            assert res.status_code == 200
+            mock_get_path.assert_called()

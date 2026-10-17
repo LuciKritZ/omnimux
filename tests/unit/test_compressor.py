@@ -217,3 +217,25 @@ def test_compress_messages_fallback_dict() -> None:
     assert len(result) == 3
     assert result[1]["role"] == "system"
     assert "compressed to fit memory limits" in result[1]["content"]
+
+
+def test_compressor_custom_model_limits_passed_directly() -> None:
+    limits = {"custom-model": 64000, "provider/custom-model": 64000}
+    compressor = ContextCompressor(model_limits=limits)
+    assert compressor.model_limits == limits
+
+
+def test_compress_messages_summary_msg_has_model_dump() -> None:
+    from omnimux.models.schemas import ChatMessage
+
+    compressor = ContextCompressor(model_limits={"test-model": 200})
+    messages = [
+        ChatMessage(role="user", content="x" * 2000),
+        ChatMessage(role="assistant", content="Response"),
+    ]
+    result = compressor.compress_messages(messages, "test-model", False)
+    assert len(result) == 2
+    assert hasattr(result[0], "model_dump")
+    dumped = result[0].model_dump()
+    assert dumped["role"] == "system"
+    assert "compressed to fit memory limits" in dumped["content"]

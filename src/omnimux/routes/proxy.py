@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import re
 import time
 import typing
 import uuid
@@ -112,8 +113,12 @@ async def _prepare_request_pipeline(
                     if i != latest_msg_index:
                         part.type = "text"
                         image_hash = cached_hashes.get(id(part), "unknown_image")
+                        cache.get_path(image_hash)
                         part.text = f"[Image: {image_hash}]"
                         part.image_url = None
+        elif isinstance(message.content, str) and "[Image: " in message.content:
+            for match in re.finditer(r"\[Image:\s*([a-f0-9]{64})\]", message.content):
+                cache.get_path(match.group(1))
 
     payload_dict_for_gatekeeper = payload.model_dump(exclude_none=True)
     profile = await gatekeeper.profile_request(payload_dict_for_gatekeeper)

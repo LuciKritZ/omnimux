@@ -46,6 +46,10 @@ def test_store_and_get_path(tmp_path: Path) -> None:
     retrieved = cache.get_path("my_hash")
     assert retrieved == file_path
 
+    file_path2 = cache.store("my_hash", b"new bytes that should not overwrite")
+    assert file_path2 == file_path
+    assert file_path.read_bytes() == b"image bytes"
+
 
 def test_store_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     cache = ImageCache(cache_dir=tmp_path)
