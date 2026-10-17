@@ -45,10 +45,15 @@ async def lifespan(app: FastAPI) -> typing.AsyncGenerator[None, None]:
 
     db_platforms = await get_all_platforms_and_models(db)
     models_dict = {**models_data.get("models", {}), **db_platforms}
+    model_limits = {
+        name: info["max_input_tokens"]
+        for name, info in models_dict.items()
+        if isinstance(info, dict) and "max_input_tokens" in info
+    }
 
     client = httpx.AsyncClient(timeout=300.0)
     unloader = ModelUnloader(http_client=client, platforms_data=models_dict)
-    compressor = ContextCompressor()
+    compressor = ContextCompressor(model_limits=model_limits)
     cache = ImageCache()
     gemini_client = GeminiClient(client=client)
 

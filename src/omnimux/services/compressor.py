@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from omnimux.config import settings
+from omnimux.models.schemas import ChatMessage
 from omnimux.utils.html import compress_html_to_markdown
 
 
@@ -10,26 +11,32 @@ class ContextCompressor:
     """Intercepts and compresses raw HTML payloads and message history to protect
     the local LLM context window."""
 
-    def __init__(self, char_threshold: int = 16384, min_reduction_ratio: float = 0.65) -> None:
+    def __init__(
+        self,
+        char_threshold: int = 16384,
+        min_reduction_ratio: float = 0.65,
+        model_limits: dict[str, int] | None = None,
+    ) -> None:
         self.char_threshold = char_threshold
         self.min_reduction_ratio = min_reduction_ratio
 
-        self.model_limits: dict[str, int] = {}
-        paths_to_try = [Path("model_prices_and_context_window.json"), Path("platforms.json")]
-        for p in paths_to_try:
-            if p.exists():
-                try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    for model_name, info in data.items():
-                        if "max_input_tokens" in info:  # pragma: no cover
-                            clean_model = (  # pragma: no cover
-                                model_name.split("/")[-1] if "/" in model_name else model_name
-                            )  # pragma: no cover
-                            self.model_limits[model_name] = info["max_input_tokens"]
-                            self.model_limits[clean_model] = info["max_input_tokens"]
-                except Exception:  # pragma: no cover
-                    pass  # pragma: no cover
-                break
+        self.model_limits: dict[str, int] = dict(model_limits) if model_limits is not None else {}
+        if not self.model_limits:
+            paths_to_try = [Path("model_prices_and_context_window.json"), Path("platforms.json")]
+            for p in paths_to_try:
+                if p.exists():
+                    try:
+                        data = json.loads(p.read_text(encoding="utf-8"))
+                        for model_name, info in data.items():
+                            if isinstance(info, dict) and "max_input_tokens" in info:
+                                clean_model = (
+                                    model_name.split("/")[-1] if "/" in model_name else model_name
+                                )
+                                self.model_limits[model_name] = info["max_input_tokens"]
+                                self.model_limits[clean_model] = info["max_input_tokens"]
+                    except Exception:  # pragma: no cover
+                        pass  # pragma: no cover
+                    break
 
     def compress_if_needed(self, text: str) -> str:
         """
@@ -144,21 +151,9 @@ class ContextCompressor:
             else:
                 # We can't fit this message entirely. We could truncate it or just stop here.
                 # For safety, let's stop including older messages.
-                # Add a summary placeholder
-                summary_msg = (
-                    msg.__class__(  # pragma: no cover
-                        role="system",  # pragma: no cover
-                        content="[System: Older context compressed to fit memory limits]",
-                    )
-                    if hasattr(msg, "__class__")
-                    and hasattr(  # pragma: no cover
-                        msg,
-                        "model_fields",  # pragma: no cover
-                    )
-                    else {  # pragma: no cover
-                        "role": "system",
-                        "content": "[System: Older context compressed to fit memory limits]",
-                    }
+                summary_msg = ChatMessage(
+                    role="system",
+                    content="[System: Older context compressed to fit memory limits]",
                 )
                 tail_messages.insert(0, summary_msg)
                 break

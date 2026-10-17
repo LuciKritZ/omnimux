@@ -19,6 +19,9 @@ class ChatMessage(BaseModel):
     content: str | list[ContentBlock]
     name: str | None = None
 
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")

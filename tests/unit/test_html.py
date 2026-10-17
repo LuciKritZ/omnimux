@@ -50,3 +50,38 @@ def test_compress_html_extracts_links() -> None:
 def test_compress_html_handles_empty_string() -> None:
     assert compress_html_to_markdown("") == ""
     assert compress_html_to_markdown("   ") == ""
+
+
+def test_compress_html_preserves_script_and_style_in_markdown_blocks() -> None:
+    content = """
+    <div>Explanation of script tags:</div>
+    ```html
+    <script>console.log('keep me');</script>
+    <style>body { background: black; }</style>
+    ```
+    <script>alert('remove me');</script>
+    """
+    result = compress_html_to_markdown(content)
+    assert "<script>console.log('keep me');</script>" in result
+    assert "<style>body { background: black; }</style>" in result
+    assert "alert('remove me')" not in result
+
+
+def test_compress_html_preserves_script_and_style_in_pre_code_tags() -> None:
+    content = """
+    <div>Here is code in HTML:</div>
+    <pre><code>
+    <script>console.log('html code');</script>
+    </code></pre>
+    <style>body { font-size: 14px; }</style>
+    """
+    result = compress_html_to_markdown(content)
+    assert "<script>console.log('html code');</script>" in result
+    assert "font-size: 14px" not in result
+
+
+def test_compress_html_preserves_inline_code() -> None:
+    content = "<div>Please use the `<script>` and `<style>` tags properly.</div>"
+    result = compress_html_to_markdown(content)
+    assert "`<script>`" in result
+    assert "`<style>`" in result
