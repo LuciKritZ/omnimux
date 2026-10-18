@@ -24,15 +24,11 @@ class GeminiClient(BaseLLMClient):
 
     def _convert_openai_to_gemini(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Converts an OpenAI ChatCompletion payload to Gemini format."""
-        contents = []
+        contents: list[dict[str, Any]] = []
+        system_parts: list[dict[str, Any]] = []
 
         for message in payload.get("messages", []):
             role = message.get("role", "user")
-            if role == "assistant":
-                role = "model"
-            elif role == "system":
-                role = "user"
-
             parts: list[dict[str, Any]] = []
             content = message.get("content", "")
 
@@ -49,10 +45,20 @@ class GeminiClient(BaseLLMClient):
                             mime_type = header.split(";")[0].removeprefix("data:")
                             parts.append({"inlineData": {"mimeType": mime_type, "data": b64_data}})
 
-            if parts:
+            if not parts:
+                continue
+
+            if role == "system":
+                system_parts.extend(parts)
+            else:
+                if role == "assistant":
+                    role = "model"
                 contents.append({"role": role, "parts": parts})
 
-        return {"contents": contents}
+        result: dict[str, Any] = {"contents": contents}
+        if system_parts:
+            result["system_instruction"] = {"parts": system_parts}
+        return result
 
     async def generate_stream(
         self,

@@ -33,7 +33,6 @@ def test_convert_openai_to_gemini() -> None:
 
     expected = {
         "contents": [
-            {"role": "user", "parts": [{"text": "You are a helpful assistant."}]},
             {"role": "user", "parts": [{"text": "What is in this image?"}]},
             {
                 "role": "user",
@@ -48,7 +47,8 @@ def test_convert_openai_to_gemini() -> None:
                 ],
             },
             {"role": "model", "parts": [{"text": "It is a pixel."}]},
-        ]
+        ],
+        "system_instruction": {"parts": [{"text": "You are a helpful assistant."}]},
     }
 
     assert gemini_format == expected
@@ -233,3 +233,15 @@ async def test_generate_stream_request_error_retries(mock_sleep: AsyncMock) -> N
 
     assert mock_client.stream.call_count == 3
     assert mock_sleep.call_count == 2
+
+
+def test_convert_openai_to_gemini_empty_parts() -> None:
+    client = GeminiClient(client=httpx.AsyncClient())
+    payload: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": []},
+            {"role": "assistant", "content": [{"type": "unknown"}]},
+        ]
+    }
+    gemini_format = client._convert_openai_to_gemini(payload)
+    assert gemini_format == {"contents": []}

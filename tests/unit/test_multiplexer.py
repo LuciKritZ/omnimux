@@ -334,3 +334,150 @@ async def test_multiplexer_quota_exceeded(
     ]
     assert chunks == ["recovered"]
     assert mock_router.mark_key_exhausted.call_count >= 1
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_mid_stream_failure_reraises(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    from omnimux.exceptions import QuotaExceededError
+
+    mock_router.get_best_platform_and_key.return_value = (
+        "openrouter",
+        {"key_hash": "h1", "key_value": "v1"},
+    )
+
+    # Yields first chunk, then raises Exception mid-stream
+    mock_client = MagicMock()
+    mock_client.generate_stream.return_value = MockStreamGen(
+        ["chunk1", RuntimeError("Mid stream network drop")]
+    )
+    mock_get_client.return_value = mock_client
+
+    multiplexer = Multiplexer(mock_router)
+    gen = multiplexer.generate_stream(["openrouter/model"], [])
+
+    assert await anext(gen) == "chunk1"
+    with pytest.raises(RuntimeError, match="Mid stream network drop"):
+        await anext(gen)
+
+    # Should not mark key exhausted or attempt fallback
+    mock_router.mark_key_exhausted.assert_not_called()
+
+    # Test mid-stream QuotaExceededError
+    mock_client.generate_stream.return_value = MockStreamGen(
+        ["chunk1", QuotaExceededError("Mid stream quota")]
+    )
+    gen2 = multiplexer.generate_stream(["openrouter/model"], [])
+    assert await anext(gen2) == "chunk1"
+    with pytest.raises(QuotaExceededError, match="Mid stream quota"):
+        await anext(gen2)
+
+    # Test mid-stream RateLimitError
+    mock_client.generate_stream.return_value = MockStreamGen(
+        ["chunk1", RateLimitError("Mid stream rate limit")]
+    )
+    gen3 = multiplexer.generate_stream(["openrouter/model"], [])
+    assert await anext(gen3) == "chunk1"
+    with pytest.raises(RateLimitError, match="Mid stream rate limit"):
+        await anext(gen3)
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_http_400_not_exhausted(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    import httpx
+
+    mock_router.get_best_platform_and_key.return_value = (
+        "openrouter",
+        {"key_hash": "h1", "key_value": "v1"},
+    )
+
+    req = httpx.Request("POST", "https://api.openrouter.ai")
+    resp = httpx.Response(400, request=req)
+    err = httpx.HTTPStatusError("Bad Request", request=req, response=resp)
+
+    mock_client = MagicMock()
+    mock_client.generate_stream.return_value = MockStreamGen([err])
+    mock_get_client.return_value = mock_client
+
+    multiplexer = Multiplexer(mock_router)
+    gen = multiplexer.generate_stream(["openrouter/model"], [])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await anext(gen)
+
+    mock_router.mark_key_exhausted.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_model_retry_indexing(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    # Two keys for openrouter, candidate models has two openrouter models
+    mock_router.get_best_platform_and_key.side_effect = [
+        ("openrouter", {"key_hash": "h1", "key_value": "v1"}),
+        ("openrouter", {"key_hash": "h2", "key_value": "v2"}),
+    ]
+
+    client1 = MagicMock()
+    client1.generate_stream.return_value = MockStreamGen([RuntimeError("Transient error")])
+
+    client2 = MagicMock()
+    client2.generate_stream.return_value = MockStreamGen(["model2_success"])
+
+    mock_get_client.side_effect = [client1, client2]
+
+    multiplexer = Multiplexer(mock_router)
+    chunks = [
+        c
+        async for c in multiplexer.generate_stream(["openrouter/model-1", "openrouter/model-2"], [])
+    ]
+
+    assert chunks == ["model2_success"]
+    # First attempt used model-1, second attempt used model-2
+    client1.generate_stream.assert_called_with("model-1", [], **{})
+    client2.generate_stream.assert_called_with("model-2", [], **{})
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_system_fallback_at_non_zero_index(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    # "system_fallback" is not at index 0, so it shouldn't trigger immediate fallback
+    mock_router.get_best_platform_and_key.side_effect = NoKeysAvailableError("No keys")
+
+    ollama_client = MagicMock()
+    ollama_client.generate_stream.return_value = MockStreamGen(["fallback_chunk"])
+    mock_get_client.return_value = ollama_client
+
+    multiplexer = Multiplexer(mock_router)
+    chunks = [
+        c async for c in multiplexer.generate_stream(["openrouter/model", "system_fallback"], [])
+    ]
+
+    assert chunks == ["fallback_chunk"]
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_explicit_ollama_custom_api_base(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    ollama_client = MagicMock()
+    ollama_client.generate_stream.return_value = MockStreamGen(["custom_ollama"])
+    mock_get_client.return_value = ollama_client
+
+    multiplexer = Multiplexer(
+        mock_router,
+        platforms_data={"ollama": {"apiBase": "http://custom-host:11434"}},
+    )
+    chunks = [c async for c in multiplexer.generate_stream(["ollama/llama3"], [])]
+
+    assert chunks == ["custom_ollama"]
+    mock_get_client.assert_called_once_with("ollama", "", None, "http://custom-host:11434")

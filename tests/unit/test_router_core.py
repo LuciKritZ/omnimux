@@ -222,3 +222,89 @@ async def test_standardized_iso_timestamps(memory_db: aiosqlite.Connection) -> N
         assert row is not None
         ts = row[0]
         assert "T" in ts, f"Timestamp {ts} must be ISO format with T for proper SQLite ordering"
+
+
+@pytest.mark.asyncio
+async def test_candidate_platform_preference_order(memory_db: aiosqlite.Connection) -> None:
+    # Insert a priority 2 key for gemini so both openrouter and gemini have top priority 2
+    await memory_db.execute(
+        """
+        INSERT INTO api_keys (platform, key_hash, key_value, priority)
+        VALUES ('gemini', 'hash5', 'val5', 2)
+        """
+    )
+    await memory_db.commit()
+
+    router = RouterCore(memory_db)
+    # When gemini is first in candidate_platforms, gemini should be chosen.
+    platform, key = await router.get_best_platform_and_key(["gemini", "openrouter"])
+    assert platform == "gemini"
+    assert key["key_hash"] == "hash5"
+
+    # When openrouter is first, openrouter should be chosen.
+    platform2, key2 = await router.get_best_platform_and_key(["openrouter", "gemini"])
+    assert platform2 == "openrouter"
+    assert key2["key_hash"] == "hash2"
+
+
+@pytest.mark.asyncio
+async def test_router_concurrent_semaphores(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    concurrent_count = 0
+    max_concurrent = 0
+
+    async def worker() -> None:
+        nonlocal concurrent_count, max_concurrent
+        async with router.use_key("hash2"):
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.02)
+            concurrent_count -= 1
+
+    await asyncio.gather(*[worker() for _ in range(5)])
+    assert max_concurrent == 5
+    assert router.is_key_busy("hash2") is False
+
+
+@pytest.mark.asyncio
+async def test_get_best_platform_and_key_busy_fallback(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Mark all openrouter keys as busy
+    router._in_flight["hash1"] = 1
+    router._in_flight["hash2"] = 1
+    router._in_flight["hash3"] = 1
+
+    # Pass 1 skips all busy keys, Pass 2 returns the highest priority busy key
+    platform, key = await router.get_best_platform_and_key(["openrouter"])
+    assert platform == "openrouter"
+    assert key["key_hash"] == "hash2"
+
+    # Now put all keys in future cooldown via DB try_after
+    now = datetime.datetime.now(datetime.UTC)
+    future = (now + datetime.timedelta(seconds=3600)).isoformat()
+    await memory_db.execute("UPDATE api_keys SET try_after = ?", (future,))
+    await memory_db.commit()
+
+    with pytest.raises(NoKeysAvailableError, match="All keys for candidate platforms"):
+        await router.get_best_platform_and_key(["openrouter"])
+
+
+@pytest.mark.asyncio
+async def test_get_next_key_db_cooldown_pass2(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Make hash2 busy so pass 1 skips it
+    router._in_flight["hash1"] = 1
+    router._in_flight["hash2"] = 1
+    router._in_flight["hash3"] = 1
+
+    now = datetime.datetime.now(datetime.UTC)
+    future = (now + datetime.timedelta(seconds=3600)).isoformat()
+    await memory_db.execute(
+        "UPDATE api_keys SET try_after = ? WHERE platform = 'openrouter'", (future,)
+    )
+    await memory_db.commit()
+
+    with pytest.raises(
+        NoKeysAvailableError, match="All keys for openrouter are currently exhausted"
+    ):
+        await router.get_next_key("openrouter")

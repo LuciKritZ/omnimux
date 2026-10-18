@@ -19,15 +19,19 @@ class NoKeysAvailableError(OmniMuxError):
 class RouterCore:
     def __init__(self, db: aiosqlite.Connection) -> None:
         self.db = db
-        # Dictionary to hold per-key locks: {key_hash: asyncio.Lock()}
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Concurrency semaphores and active in-flight counters per key
+        self._semaphores: dict[str, asyncio.Semaphore] = {}
+        self._in_flight: dict[str, int] = {}
         # In-memory cooldown cache to avoid hitting DB constantly for expired keys
         self._cooldowns: dict[str, float] = {}
 
-    def _get_lock(self, key_hash: str) -> asyncio.Lock:
-        if key_hash not in self._locks:
-            self._locks[key_hash] = asyncio.Lock()
-        return self._locks[key_hash]
+    def _get_semaphore(self, key_hash: str, limit: int = 10) -> asyncio.Semaphore:
+        if key_hash not in self._semaphores:
+            self._semaphores[key_hash] = asyncio.Semaphore(limit)
+        return self._semaphores[key_hash]
+
+    def is_key_busy(self, key_hash: str) -> bool:
+        return self._in_flight.get(key_hash, 0) > 0
 
     async def get_next_key(self, platform: str) -> dict[str, Any]:
         """
@@ -73,9 +77,8 @@ class RouterCore:
                     await self.db.commit()
 
             # If we get here, the key is not in cooldown.
-            # Check if the lock is currently held. Skip to next to maximize concurrency.
-            lock = self._get_lock(key_hash)
-            if lock.locked():
+            # Check if the key is currently busy. Skip to next to maximize concurrency.
+            if self.is_key_busy(key_hash):
                 continue
 
             return {
@@ -85,8 +88,8 @@ class RouterCore:
                 "meta": meta,
             }
 
-        # Second pass: if all unlocked keys are in cooldown, can we wait on a locked key?
-        # We return the first non-cooldown key, even if locked.
+        # Second pass: if all unlocked keys are in cooldown, can we wait on a busy key?
+        # We return the first non-cooldown key, even if busy.
         for row in rows:
             key_hash, key_value, priority, try_after, _, meta = row
             if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
@@ -105,12 +108,14 @@ class RouterCore:
 
     @asynccontextmanager
     async def use_key(self, key_hash: str) -> AsyncGenerator[None, None]:
-        """Context manager to lock a key during usage and update its last_used_at."""
-        lock = self._get_lock(key_hash)
-        async with lock:
+        """Context manager to track active in-flight requests and update last_used_at."""
+        sem = self._get_semaphore(key_hash)
+        async with sem:
+            self._in_flight[key_hash] = self._in_flight.get(key_hash, 0) + 1
             try:
                 yield
             finally:
+                self._in_flight[key_hash] = max(0, self._in_flight.get(key_hash, 1) - 1)
                 await self.mark_key_used(key_hash)
 
     async def get_best_platform_and_key(
@@ -118,7 +123,7 @@ class RouterCore:
     ) -> tuple[str, dict[str, Any]]:
         """
         Retrieves the best available platform and key from a list of candidates.
-        Prioritizes highest `priority`, then oldest `last_used_at`.
+        Prioritizes highest `priority`, then caller candidate order, then oldest `last_used_at`.
         """
         now_dt = datetime.datetime.now(datetime.UTC)
         now = now_dt.timestamp()
@@ -131,39 +136,61 @@ class RouterCore:
             SELECT platform, key_hash, key_value, priority, try_after, last_used_at, meta
             FROM api_keys
             WHERE platform IN ({placeholders})
-            ORDER BY priority DESC, last_used_at ASC
         """
 
         async with self.db.execute(query, candidate_platforms) as cursor:
-            rows = await cursor.fetchall()
+            rows = list(await cursor.fetchall())
 
         if not rows:
             raise NoKeysAvailableError(
                 f"No keys configured for candidate platforms: {candidate_platforms}"
             )
 
+        # Prioritize candidates by caller's specified preference order
+        # before sorting by last_used_at
+        platform_order = {p: i for i, p in enumerate(candidate_platforms)}
+        rows.sort(key=lambda r: (-r[3], platform_order.get(r[0], 9999), r[5] or ""))
+
+        # Pass 1: skip keys in cooldown and busy keys
         for row in rows:
             platform, key_hash, key_value, _priority, try_after, _, meta = row
 
-            # Check in-memory fast path cooldown
             if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
                 continue
 
-            # DB level cooldown check
             if try_after:
                 try_after_ts = datetime.datetime.fromisoformat(try_after).timestamp()
                 if try_after_ts > now:
                     self._cooldowns[key_hash] = try_after_ts
                     continue
                 else:
-                    # Cooldown expired, clear it
                     self._cooldowns.pop(key_hash, None)
                     await self.db.execute(
                         "UPDATE api_keys SET try_after = NULL WHERE key_hash = ?", (key_hash,)
                     )
                     await self.db.commit()
 
-            # Not in cooldown, update last_used_at and return
+            if self.is_key_busy(key_hash):
+                continue
+
+            await self.db.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
+                (now_dt.isoformat(), key_hash),
+            )
+            await self.db.commit()
+
+            return platform, {
+                "key_hash": key_hash,
+                "key_value": key_value,
+                "meta": meta,
+            }
+
+        # Pass 2: fallback to busy key if not in cooldown
+        for row in rows:
+            platform, key_hash, key_value, _priority, try_after, _, meta = row
+            if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
+                continue
+
             await self.db.execute(
                 "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
                 (now_dt.isoformat(), key_hash),
