@@ -106,3 +106,47 @@ async def test_unloader_error_handling(mock_client: AsyncMock) -> None:
 
     assert result is True
     assert engine._active_model == "test-target-model"
+
+
+@pytest.mark.asyncio
+async def test_unloader_skips_cloud_models(mock_client: AsyncMock) -> None:
+    engine = ModelUnloader(http_client=mock_client)
+    for cloud_model in [
+        "anthropic/claude-3-opus",
+        "openai/gpt-4o",
+        "claude-3-5-sonnet",
+        "gpt-4",
+        "gemini-1.5-pro",
+    ]:
+        engine._active_model = cloud_model
+        unloaded = await engine.unload_if_needed("new-model")
+        assert unloaded is False
+        assert engine._active_model == "new-model"
+        assert mock_client.post.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unloader_platforms_data_and_prefixes(mock_client: AsyncMock) -> None:
+    platforms_data = {
+        "cloud-custom": {"platform": "openrouter"},
+        "ollama-custom": {"platform": "ollama"},
+        "non-dict": "string-val",
+    }
+    engine = ModelUnloader(http_client=mock_client, platforms_data=platforms_data)
+
+    assert engine._is_ollama_model("cloud-custom") is False
+    assert engine._is_ollama_model("ollama-custom") is True
+    assert engine._is_ollama_model("non-dict") is True
+    assert engine._is_ollama_model("ollama/llama3") is True
+    assert engine._is_ollama_model("gemini.flash") is False
+
+    req = httpx.Request("POST", "http://127.0.0.1:11434/api/generate")
+    mock_client.post.return_value = httpx.Response(200, json={"status": "success"}, request=req)
+
+    engine._active_model = "ollama/llama3"
+    unloaded = await engine.unload_if_needed("target-model")
+    assert unloaded is True
+    mock_client.post.assert_called_once_with(
+        "http://127.0.0.1:11434/api/generate",
+        json={"model": "llama3", "keep_alive": 0},
+    )

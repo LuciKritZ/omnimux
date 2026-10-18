@@ -90,3 +90,39 @@ def test_checklist_interactive_cancel() -> None:
     ):
         res = run_checklist([("m1", "Model 1")])
         assert res == []
+
+
+def test_checklist_interactive_standalone_escape() -> None:
+    # Keys: '\x1b' with empty select
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = True
+    mock_stdin.fileno.return_value = 0
+    mock_stdin.read.side_effect = ["\x1b"]
+
+    with (
+        patch("sys.stdin", mock_stdin),
+        patch("select.select", return_value=([], [], [])),
+        patch("termios.tcgetattr", return_value=[]),
+        patch("termios.tcsetattr"),
+        patch("tty.setraw"),
+    ):
+        res = run_checklist([("m1", "Model 1")])
+        assert res == []
+
+
+def test_checklist_interactive_escape_select_exception() -> None:
+    # Keys: '\x1b' then '[A' (up arrow) when select raises exception
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = True
+    mock_stdin.fileno.return_value = 0
+    mock_stdin.read.side_effect = ["\x1b", "[A", "\n"]
+
+    with (
+        patch("sys.stdin", mock_stdin),
+        patch("select.select", side_effect=OSError("Not supported")),
+        patch("termios.tcgetattr", return_value=[]),
+        patch("termios.tcsetattr"),
+        patch("tty.setraw"),
+    ):
+        res = run_checklist([("m1", "Model 1")])
+        assert res == ["m1"]

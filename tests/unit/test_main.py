@@ -279,3 +279,112 @@ def test_main_stop_error(tmp_path: Any, capsys: pytest.CaptureFixture[str]) -> N
         main()
         assert not test_pid.exists()
         assert "Error stopping proxy: denied" in capsys.readouterr().out
+
+
+def test_main_status_no_pid(tmp_path: Any, capsys: pytest.CaptureFixture[str]) -> None:
+    import omnimux.__main__ as main_mod
+
+    test_pid = tmp_path / ".nonexistent.pid"
+    with (
+        patch.object(main_mod, "PID_FILE", test_pid),
+        patch.object(sys, "argv", ["omnimux", "status"]),
+    ):
+        main()
+        assert "Omnimux proxy is not running (no active PID file)" in capsys.readouterr().out
+
+
+def test_main_status_stale_pid(tmp_path: Any, capsys: pytest.CaptureFixture[str]) -> None:
+    import omnimux.__main__ as main_mod
+
+    test_pid = tmp_path / ".test.pid"
+    test_port = tmp_path / ".test.port"
+    test_pid.write_text("12345")
+    test_port.write_text("11444")
+    with (
+        patch.object(main_mod, "PID_FILE", test_pid),
+        patch.object(main_mod, "PORT_FILE", test_port),
+        patch("os.kill", side_effect=ProcessLookupError),
+        patch.object(sys, "argv", ["omnimux", "status"]),
+    ):
+        main()
+        assert not test_pid.exists()
+        assert not test_port.exists()
+        assert "Omnimux proxy is not running (stale PID file found)" in capsys.readouterr().out
+
+
+def test_main_status_running_healthy(tmp_path: Any, capsys: pytest.CaptureFixture[str]) -> None:
+    import omnimux.__main__ as main_mod
+
+    test_pid = tmp_path / ".test.pid"
+    test_port = tmp_path / ".test.port"
+    test_pid.write_text("12345")
+    test_port.write_text("11444")
+    mock_socket = MagicMock()
+    mock_socket.connect.return_value = None
+
+    with (
+        patch.object(main_mod, "PID_FILE", test_pid),
+        patch.object(main_mod, "PORT_FILE", test_port),
+        patch("os.kill", return_value=None),
+        patch("socket.socket", return_value=mock_socket),
+        patch.object(sys, "argv", ["omnimux", "status"]),
+    ):
+        main()
+        out = capsys.readouterr().out
+        assert "Omnimux proxy is running (PID: 12345, Port: 11444, Status: Healthy)" in out
+
+
+def test_main_status_running_active_fallback_port(
+    tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import omnimux.__main__ as main_mod
+
+    test_pid = tmp_path / ".test.pid"
+    test_port = tmp_path / ".test.port"
+    test_pid.write_text("12345")
+    test_port.write_text("not-a-port")
+    mock_socket = MagicMock()
+    mock_socket.connect.side_effect = OSError("Connection refused")
+
+    with (
+        patch.object(main_mod, "PID_FILE", test_pid),
+        patch.object(main_mod, "PORT_FILE", test_port),
+        patch("os.kill", return_value=None),
+        patch("socket.socket", return_value=mock_socket),
+        patch.object(sys, "argv", ["omnimux", "status"]),
+    ):
+        main()
+        out = capsys.readouterr().out
+        assert "Status: Active" in out
+
+
+def test_main_status_running_no_port_file(
+    tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import omnimux.__main__ as main_mod
+
+    test_pid = tmp_path / ".test.pid"
+    test_port = tmp_path / ".nonexistent.port"
+    test_pid.write_text("12345")
+    mock_socket = MagicMock()
+    mock_socket.connect.return_value = None
+
+    with (
+        patch.object(main_mod, "PID_FILE", test_pid),
+        patch.object(main_mod, "PORT_FILE", test_port),
+        patch("os.kill", return_value=None),
+        patch("socket.socket", return_value=mock_socket),
+        patch.object(sys, "argv", ["omnimux", "status"]),
+    ):
+        main()
+        out = capsys.readouterr().out
+        assert "Omnimux proxy is running (PID: 12345, Port: 11444, Status: Healthy)" in out
+
+
+@patch("omnimux.__main__.uvicorn.run")
+def test_main_top_level_host(mock_run: MagicMock) -> None:
+    with patch.object(sys, "argv", ["omnimux", "--host", "127.0.0.1"]):
+        main()
+    mock_run.assert_called_once_with(
+        "omnimux.app:create_app", host="127.0.0.1", port=11444, factory=True
+    )

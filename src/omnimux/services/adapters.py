@@ -1,6 +1,7 @@
 import abc
 import json
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -17,6 +18,14 @@ class BaseLLMClient(abc.ABC):
         self.api_key = api_key
         self.base_url = base_url
         self.client = client
+
+    @asynccontextmanager
+    async def _get_client(self) -> AsyncGenerator[httpx.AsyncClient, None]:
+        if self.client:
+            yield self.client
+        else:
+            async with httpx.AsyncClient() as client:
+                yield client
 
     @abc.abstractmethod
     async def generate_stream(
@@ -55,10 +64,12 @@ class OpenAICompatibleClient(BaseLLMClient):
             **kwargs,
         }
 
-        client_to_use = self.client or httpx.AsyncClient()
-        async with client_to_use.stream(
-            "POST", f"{self.base_url}/v1/chat/completions", headers=headers, json=payload
-        ) as response:
+        async with (
+            self._get_client() as client_to_use,
+            client_to_use.stream(
+                "POST", f"{self.base_url}/v1/chat/completions", headers=headers, json=payload
+            ) as response,
+        ):
             if response.status_code != 200:
                 self.handle_error(response)
 
@@ -138,10 +149,12 @@ class AnthropicClient(BaseLLMClient):
             ]:
                 payload[k] = v
 
-        client_to_use = self.client or httpx.AsyncClient()
-        async with client_to_use.stream(
-            "POST", f"{self.base_url}/v1/messages", headers=headers, json=payload
-        ) as response:
+        async with (
+            self._get_client() as client_to_use,
+            client_to_use.stream(
+                "POST", f"{self.base_url}/v1/messages", headers=headers, json=payload
+            ) as response,
+        ):
             if response.status_code != 200:
                 self.handle_error(response)
 

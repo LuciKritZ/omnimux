@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI) -> typing.AsyncGenerator[None, None]:
     from pathlib import Path
 
     models_data = {}
-    models_path = Path("models.json")
+    models_path = Path(settings.models_json_path)
     if models_path.exists():
         try:
             with open(models_path, encoding="utf-8") as f:

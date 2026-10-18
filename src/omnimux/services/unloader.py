@@ -16,6 +16,29 @@ class ModelUnloader:
         self._active_model: str | None = None
         self._lock = asyncio.Lock()
 
+    def _is_ollama_model(self, model: str) -> bool:
+        """Determines if a model belongs to Ollama rather than a remote cloud provider."""
+        lower_model = model.lower()
+        cloud_prefixes = ("anthropic", "openai", "gemini", "groq", "openrouter")
+        prefix = lower_model.split("/")[0] if "/" in lower_model else lower_model.split(".")[0]
+        if prefix in cloud_prefixes:
+            return False
+
+        if model in self.platforms_data:
+            info = self.platforms_data[model]
+            if isinstance(info, dict):
+                platform = str(info.get("platform", "")).lower()
+                if platform and platform != "ollama":
+                    return False
+                if platform == "ollama":
+                    return True
+
+        if lower_model.startswith("ollama/") or lower_model.startswith("ollama."):
+            return True
+
+        cloud_name_starts = ("claude", "gpt", "gemini", "o1-", "o3-", "chatgpt")
+        return not any(lower_model.startswith(c) for c in cloud_name_starts)
+
     async def unload_if_needed(self, target_model: str) -> bool:
         """Unloads the active model if it differs from the target model.
 
@@ -43,11 +66,16 @@ class ModelUnloader:
                 self._active_model = target_model
                 return False
 
+            if not self._is_ollama_model(self._active_model):
+                self._active_model = target_model
+                return False
+
             ollama_info = self.platforms_data.get("system_fallback", {})
             ollama_url = ollama_info.get("apiBase", "http://127.0.0.1:11434").rstrip("/")
             url = f"{ollama_url}/api/generate"
+            unload_model = self._active_model.removeprefix("ollama/")
             payload = {
-                "model": self._active_model,
+                "model": unload_model,
                 "keep_alive": 0,
             }
 
