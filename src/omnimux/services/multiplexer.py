@@ -70,7 +70,7 @@ class Multiplexer:
         """
         Attempts to generate a stream across multiple candidate models dynamically.
         """
-        if "system_fallback" in candidate_models:
+        if candidate_models and candidate_models[0] == "system_fallback":
             logger.info("Using system fallback model")
             fallback_info = self.platforms_data.get("system_fallback", {})
             fallback_model = fallback_info.get("model", "llama3")
@@ -86,6 +86,8 @@ class Multiplexer:
         supported_platforms = {"anthropic", "openai", "gemini", "groq", "openrouter", "ollama"}
 
         for c in candidate_models:
+            if c == "system_fallback":
+                continue
             if "/" in c:
                 parts = c.split("/", 1)
             elif "." in c and c.split(".", 1)[0] in supported_platforms:
@@ -99,7 +101,14 @@ class Multiplexer:
             # Special case for explicit ollama
             if p == "ollama":
                 logger.info(f"Using explicit ollama model {m}")
-                ollama_client = get_client_for_platform("ollama", "", self.http_client, None)
+                ollama_api_base = (
+                    self.platforms_data.get("ollama", {}).get("apiBase")
+                    or self.platforms_data.get(c, {}).get("apiBase")
+                    or self.platforms_data.get(f"ollama/{m}", {}).get("apiBase")
+                )
+                ollama_client = get_client_for_platform(
+                    "ollama", "", self.http_client, ollama_api_base
+                )
                 async for chunk in ollama_client.generate_stream(m, messages, **kwargs):
                     yield chunk
                 return
@@ -109,6 +118,7 @@ class Multiplexer:
             platform_to_models[p].append((c, m))
 
         candidate_platforms = list(platform_to_models.keys())
+        platform_model_index: dict[str, int] = {p: 0 for p in platform_to_models}
         max_retries = max(3, len(candidate_platforms) * 2) if candidate_platforms else 0
         attempts = 0
 
@@ -130,8 +140,12 @@ class Multiplexer:
                 except Exception:
                     meta_val = {}
 
-            # Pick the first model matched for this platform
-            full_model_key, target_model = platform_to_models[platform][0]
+            # Pick candidate model matched for this platform based on retry index
+            models_for_platform = platform_to_models[platform]
+            current_model_idx = platform_model_index.get(platform, 0)
+            full_model_key, target_model = models_for_platform[
+                current_model_idx % len(models_for_platform)
+            ]
             api_base = (
                 meta_val.get("api_base")
                 or meta_val.get("apiBase")
@@ -169,6 +183,7 @@ class Multiplexer:
                 platform, key_value, self.http_client, api_base, protocol
             )
 
+            first_chunk_emitted = False
             try:
                 async with self.router_core.use_key(key_hash):
                     stream_gen = client.generate_stream(target_model, messages, **kwargs)
@@ -178,6 +193,7 @@ class Multiplexer:
                     except StopAsyncIteration:
                         return
 
+                    first_chunk_emitted = True
                     yield first_chunk
 
                     async for chunk in stream_gen:
@@ -186,6 +202,9 @@ class Multiplexer:
                     return
 
             except QuotaExceededError as e:
+                if first_chunk_emitted:
+                    raise
+                platform_model_index[platform] = current_model_idx + 1
                 cooldown_sec = settings.default_cooldown_minutes * 60.0
                 logger.warning(
                     f"Quota exceeded on {platform} key {key_hash}: {e}. Swapping platform..."
@@ -193,10 +212,18 @@ class Multiplexer:
                 await self.router_core.mark_key_exhausted(key_hash, cooldown_sec)
                 attempts += 1
             except RateLimitError as e:
+                if first_chunk_emitted:
+                    raise
+                platform_model_index[platform] = current_model_idx + 1
                 logger.warning(f"Rate limit on {platform} key {key_hash}: {e}. Swapping...")
                 await self.router_core.mark_key_exhausted(key_hash, e.retry_after or 60.0)
                 attempts += 1
             except Exception as e:
+                if first_chunk_emitted:
+                    raise
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
+                    raise
+                platform_model_index[platform] = current_model_idx + 1
                 logger.warning(f"Error on {platform} key {key_hash}: {e}. Swapping...")
                 await self.router_core.mark_key_exhausted(key_hash, 60.0)
                 attempts += 1
