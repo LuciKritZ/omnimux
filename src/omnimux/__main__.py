@@ -25,8 +25,10 @@ from omnimux.services.model_discovery import (
     run_add_model_wizard,
 )
 
-PID_FILE = Path(".omnimux.pid")
-LOG_FILE = Path("omnimux.log")
+OMNIMUX_DIR = Path.home() / ".omnimux"
+PID_FILE = OMNIMUX_DIR / ".omnimux.pid"
+LOG_FILE = OMNIMUX_DIR / "omnimux.log"
+PORT_FILE = OMNIMUX_DIR / ".omnimux.port"
 
 
 async def _get_db() -> aiosqlite.Connection:
@@ -52,6 +54,7 @@ def handle_start(args: Any) -> None:
             except (OSError, ValueError):
                 PID_FILE.unlink(missing_ok=True)
 
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as log_out:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "omnimux", "start", "--host", host, "--port", str(port)],
@@ -59,7 +62,10 @@ def handle_start(args: Any) -> None:
                 stderr=log_out,
                 start_new_session=True,
             )
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
         PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+        PORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PORT_FILE.write_text(str(port), encoding="utf-8")
         print(f"Omnimux proxy started in detached mode (PID: {proc.pid}). Logs: {LOG_FILE}")
         return
 
@@ -80,6 +86,48 @@ def handle_stop(args: Any = None) -> None:
         print(f"Error stopping proxy: {e}")
     finally:
         PID_FILE.unlink(missing_ok=True)
+        PORT_FILE.unlink(missing_ok=True)
+
+
+def handle_status(args: Any = None) -> None:
+    if not PID_FILE.exists():
+        print("Omnimux proxy is not running (no active PID file).")
+        return
+
+    try:
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError, ProcessLookupError):
+        print("Omnimux proxy is not running (stale PID file found). Cleaning up.")
+        PID_FILE.unlink(missing_ok=True)
+        PORT_FILE.unlink(missing_ok=True)
+        return
+
+    port = getattr(args, "port", None)
+    if not port and PORT_FILE.exists():
+        try:
+            port = int(PORT_FILE.read_text(encoding="utf-8").strip())
+        except ValueError:
+            port = settings.port
+    if not port:
+        port = settings.port
+
+    import socket
+
+    health = "Active"
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        health = "Healthy"
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+    print(
+        f"Omnimux proxy is running (PID: {pid}, Port: {port}, Status: {health}). Logs: {LOG_FILE}"
+    )
 
 
 async def _handle_keys(args: Any) -> None:
@@ -157,6 +205,10 @@ def main() -> None:
     # stop subcommand
     subparsers.add_parser("stop", help="Stop detached Omnimux proxy server")
 
+    # status subcommand
+    status_parser = subparsers.add_parser("status", help="Inspect status of running Omnimux proxy")
+    status_parser.add_argument("--port", type=int, default=None, help="Port to check")
+
     # model subcommand
     model_parser = subparsers.add_parser("model", help="Manage upstream models and platforms")
     model_sub = model_parser.add_subparsers(dest="model_action")
@@ -183,6 +235,7 @@ def main() -> None:
     cache_parser.add_argument("--clear", action="store_true", help="Clear cache")
 
     # Top-level backwards compatibility options
+    parser.add_argument("--host", type=str, default="0.0.0.0", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, default=settings.port, help=argparse.SUPPRESS)
     parser.add_argument("-d", "--detach", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--clear-cache", action="store_true", help=argparse.SUPPRESS)
@@ -196,6 +249,8 @@ def main() -> None:
 
     if args.command == "stop":
         handle_stop(args)
+    elif args.command == "status":
+        handle_status(args)
     elif args.command == "model":
         asyncio.run(_handle_model(args))
     elif args.command == "keys":

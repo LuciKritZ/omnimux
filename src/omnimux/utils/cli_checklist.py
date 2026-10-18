@@ -1,3 +1,4 @@
+import select
 import sys
 from collections.abc import Sequence
 
@@ -56,12 +57,20 @@ def run_checklist(
                 cursor = (cursor - 1) % total
             elif ch == "j":
                 cursor = (cursor + 1) % total
-            elif ch == "\x1b":  # Escape sequence for arrow keys
-                seq = sys.stdin.read(2)
-                if seq == "[A":  # Up
-                    cursor = (cursor - 1) % total
-                elif seq == "[B":  # Down
-                    cursor = (cursor + 1) % total
+            elif ch == "\x1b":  # Escape sequence for arrow keys or standalone Escape
+                try:
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                except Exception:
+                    r = [sys.stdin]
+                if r:
+                    seq = sys.stdin.read(2)
+                    if seq == "[A":  # Up
+                        cursor = (cursor - 1) % total
+                    elif seq == "[B":  # Down
+                        cursor = (cursor + 1) % total
+                else:
+                    sys.stdout.write("\nCancelled.\n")
+                    return []
             elif ch == "\x03" or ch == "q":  # Ctrl+C or q
                 sys.stdout.write("\nCancelled.\n")
                 return []
