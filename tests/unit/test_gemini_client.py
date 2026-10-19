@@ -245,3 +245,18 @@ def test_convert_openai_to_gemini_empty_parts() -> None:
     }
     gemini_format = client._convert_openai_to_gemini(payload)
     assert gemini_format == {"contents": []}
+
+
+def test_gemini_client_billing_exhaustion_400() -> None:
+    client = GeminiClient(client=httpx.AsyncClient())
+    req = httpx.Request("POST", "https://generativelanguage.googleapis.com")
+    resp_billing = httpx.Response(
+        400,
+        request=req,
+        text=(
+            '{"error": {"status": "RESOURCE_EXHAUSTED", '
+            '"message": "Quota exceeded for quota metric"}}'
+        ),
+    )
+    with pytest.raises(QuotaExceededError, match="Gemini Quota Exceeded"):
+        client.handle_error(resp_billing)
