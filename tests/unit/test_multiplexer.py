@@ -481,3 +481,86 @@ async def test_multiplexer_explicit_ollama_custom_api_base(
 
     assert chunks == ["custom_ollama"]
     mock_get_client.assert_called_once_with("ollama", "", None, "http://custom-host:11434")
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.asyncio.sleep")
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_retry_jitter_invoked(
+    mock_get_client: MagicMock, mock_sleep: AsyncMock, mock_router: MagicMock
+) -> None:
+    mock_router.get_best_platform_and_key.side_effect = [
+        ("openrouter", {"key_hash": "h1", "key_value": "v1"}),
+        ("openrouter", {"key_hash": "h2", "key_value": "v2"}),
+    ]
+
+    client1 = MagicMock()
+    client1.generate_stream.return_value = MockStreamGen([RateLimitError("429", retry_after=30.0)])
+    client2 = MagicMock()
+    client2.generate_stream.return_value = MockStreamGen(["success_chunk"])
+    mock_get_client.side_effect = [client1, client2]
+
+    multiplexer = Multiplexer(mock_router, enable_jitter=True)
+    chunks = [c async for c in multiplexer.generate_stream(["openrouter/model"], [])]
+
+    assert chunks == ["success_chunk"]
+    mock_sleep.assert_awaited_once()
+    slept_duration = mock_sleep.call_args[0][0]
+    assert 0.05 <= slept_duration <= 0.25
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.asyncio.sleep")
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_retry_jitter_disabled(
+    mock_get_client: MagicMock, mock_sleep: AsyncMock, mock_router: MagicMock
+) -> None:
+    mock_router.get_best_platform_and_key.side_effect = [
+        ("openrouter", {"key_hash": "h1", "key_value": "v1"}),
+        ("openrouter", {"key_hash": "h2", "key_value": "v2"}),
+    ]
+
+    client1 = MagicMock()
+    client1.generate_stream.return_value = MockStreamGen([RateLimitError("429", retry_after=30.0)])
+    client2 = MagicMock()
+    client2.generate_stream.return_value = MockStreamGen(["success_chunk"])
+    mock_get_client.side_effect = [client1, client2]
+
+    multiplexer = Multiplexer(mock_router, enable_jitter=False)
+    chunks = [c async for c in multiplexer.generate_stream(["openrouter/model"], [])]
+
+    assert chunks == ["success_chunk"]
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_idempotency_after_first_chunk(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    mock_router.get_best_platform_and_key.return_value = (
+        "openrouter",
+        {"key_hash": "h1", "key_value": "v1"},
+    )
+
+    client1 = MagicMock()
+    # Emits first chunk, then raises RateLimitError mid-stream
+    client1.generate_stream.return_value = MockStreamGen(
+        ["first_token", RateLimitError("mid-stream 429")]
+    )
+    mock_get_client.return_value = client1
+
+    multiplexer = Multiplexer(mock_router)
+    stream = multiplexer.generate_stream(["openrouter/model"], [])
+
+    # The first token is yielded safely
+    first = await anext(stream)
+    assert first == "first_token"
+
+    # Once first chunk is emitted, failover retry is blocked for idempotency
+    with pytest.raises(RateLimitError, match="mid-stream 429"):
+        await anext(stream)
+
+    # Secondary failover or mark_exhausted was not invoked
+    assert mock_router.get_best_platform_and_key.call_count == 1
+    mock_router.mark_key_exhausted.assert_not_called()

@@ -1,12 +1,14 @@
 import asyncio
 import datetime
+import json
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import aiosqlite
 
+from omnimux.config import settings
 from omnimux.exceptions import OmniMuxError
 
 logger = logging.getLogger(__name__)
@@ -24,19 +26,57 @@ class RouterCore:
         self._in_flight: dict[str, int] = {}
         # In-memory cooldown cache to avoid hitting DB constantly for expired keys
         self._cooldowns: dict[str, float] = {}
+        # Round-robin counter per platform/selection
+        self._rr_index: dict[str, int] = {}
+        # Cached concurrency limit per key
+        self._key_concurrency_limits: dict[str, int] = {}
 
-    def _get_semaphore(self, key_hash: str, limit: int = 10) -> asyncio.Semaphore:
+    def get_key_concurrency_limit(self, key_hash: str, meta: Any = None) -> int:
+        """Determines the maximum concurrency limit for a key from meta or settings."""
+        if key_hash in self._key_concurrency_limits and meta is None:
+            return self._key_concurrency_limits[key_hash]
+
+        limit = settings.default_key_concurrency
+        if meta:
+            parsed_meta: dict[str, Any] = {}
+            if isinstance(meta, str):
+                try:
+                    parsed_meta = json.loads(meta)
+                except Exception:
+                    parsed_meta = {}
+            elif isinstance(meta, dict):
+                parsed_meta = meta
+
+            val = parsed_meta.get("max_concurrency") or parsed_meta.get("concurrency_limit")
+            if val is not None:
+                with suppress(ValueError, TypeError):
+                    limit = int(val)
+
+        self._key_concurrency_limits[key_hash] = limit
+        return limit
+
+    def _get_semaphore(self, key_hash: str, limit: int | None = None) -> asyncio.Semaphore:
         if key_hash not in self._semaphores:
-            self._semaphores[key_hash] = asyncio.Semaphore(limit)
+            effective_limit = (
+                limit if limit is not None else self.get_key_concurrency_limit(key_hash)
+            )
+            self._semaphores[key_hash] = asyncio.Semaphore(effective_limit)
         return self._semaphores[key_hash]
 
+    def get_in_flight_count(self, key_hash: str) -> int:
+        return self._in_flight.get(key_hash, 0)
+
     def is_key_busy(self, key_hash: str) -> bool:
-        return self._in_flight.get(key_hash, 0) > 0
+        return self.get_in_flight_count(key_hash) > 0
+
+    def is_key_at_capacity(self, key_hash: str, limit: int | None = None) -> bool:
+        effective_limit = limit if limit is not None else self.get_key_concurrency_limit(key_hash)
+        return self.get_in_flight_count(key_hash) >= effective_limit
 
     async def get_next_key(self, platform: str) -> dict[str, Any]:
         """
         Retrieves the best available key for a given platform.
-        Prioritizes highest `priority`, then oldest `last_used_at`.
+        Prioritizes highest `priority`, then round-robin / least-loaded balancing.
         Skips keys currently in cooldown (try_after).
         """
         now = datetime.datetime.now(datetime.UTC).timestamp()
@@ -50,66 +90,85 @@ class RouterCore:
             """,
             (platform,),
         ) as cursor:
-            rows = await cursor.fetchall()
+            rows = list(await cursor.fetchall())
 
         if not rows:
             raise NoKeysAvailableError(f"No keys configured for platform: {platform}")
 
+        valid_rows = []
         for row in rows:
-            key_hash, key_value, priority, try_after, _, meta = row
+            key_hash, _, _, try_after, _, meta = row
 
-            # Check in-memory fast path cooldown
             if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
                 continue
 
-            # DB level cooldown check
             if try_after:
                 try_after_ts = datetime.datetime.fromisoformat(try_after).timestamp()
                 if try_after_ts > now:
                     self._cooldowns[key_hash] = try_after_ts
                     continue
                 else:
-                    # Cooldown expired, clear it
                     self._cooldowns.pop(key_hash, None)
                     await self.db.execute(
                         "UPDATE api_keys SET try_after = NULL WHERE key_hash = ?", (key_hash,)
                     )
                     await self.db.commit()
 
-            # If we get here, the key is not in cooldown.
-            # Check if the key is currently busy. Skip to next to maximize concurrency.
-            if self.is_key_busy(key_hash):
-                continue
+            self.get_key_concurrency_limit(key_hash, meta)
+            valid_rows.append(row)
 
+        if not valid_rows:
+            raise NoKeysAvailableError(
+                f"All keys for {platform} are currently exhausted or in cooldown."
+            )
+
+        rr_offset = self._rr_index.get(platform, 0)
+
+        # Pass 1: select from idle keys (in_flight == 0)
+        idle_rows = [r for r in valid_rows if not self.is_key_busy(r[0])]
+        if idle_rows:
+            highest_priority = max(r[2] for r in idle_rows)
+            best_idle = [r for r in idle_rows if r[2] == highest_priority]
+            best_idle.sort(key=lambda r: r[4] or "")
+            oldest_ts = best_idle[0][4] or ""
+            same_ts = [r for r in best_idle if (r[4] or "") == oldest_ts]
+            selected = same_ts[rr_offset % len(same_ts)]
+            self._rr_index[platform] = rr_offset + 1
             return {
-                "key_hash": key_hash,
-                "key_value": key_value,
-                "priority": priority,
-                "meta": meta,
+                "key_hash": selected[0],
+                "key_value": selected[1],
+                "priority": selected[2],
+                "meta": selected[5],
             }
 
-        # Second pass: if all unlocked keys are in cooldown, can we wait on a busy key?
-        # We return the first non-cooldown key, even if busy.
-        for row in rows:
-            key_hash, key_value, priority, try_after, _, meta = row
-            if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
-                continue
+        # Pass 2: fallback to busy keys (least-loaded under capacity first)
+        under_capacity = [r for r in valid_rows if not self.is_key_at_capacity(r[0])]
+        candidates = under_capacity if under_capacity else valid_rows
 
-            return {
-                "key_hash": key_hash,
-                "key_value": key_value,
-                "priority": priority,
-                "meta": meta,
-            }
+        highest_priority = max(r[2] for r in candidates)
+        best_candidates = [r for r in candidates if r[2] == highest_priority]
+        best_candidates.sort(key=lambda r: (self.get_in_flight_count(r[0]), r[4] or ""))
 
-        raise NoKeysAvailableError(
-            f"All keys for {platform} are currently exhausted or in cooldown."
-        )
+        min_load = self.get_in_flight_count(best_candidates[0][0])
+        min_load_candidates = [
+            r for r in best_candidates if self.get_in_flight_count(r[0]) == min_load
+        ]
+        oldest_ts = min_load_candidates[0][4] or ""
+        same_load_ts = [r for r in min_load_candidates if (r[4] or "") == oldest_ts]
+        selected = same_load_ts[rr_offset % len(same_load_ts)]
+        self._rr_index[platform] = rr_offset + 1
+
+        return {
+            "key_hash": selected[0],
+            "key_value": selected[1],
+            "priority": selected[2],
+            "meta": selected[5],
+        }
 
     @asynccontextmanager
-    async def use_key(self, key_hash: str) -> AsyncGenerator[None, None]:
+    async def use_key(self, key_hash: str, limit: int | None = None) -> AsyncGenerator[None, None]:
         """Context manager to track active in-flight requests and update last_used_at."""
-        sem = self._get_semaphore(key_hash)
+        sem = self._get_semaphore(key_hash, limit)
         async with sem:
             self._in_flight[key_hash] = self._in_flight.get(key_hash, 0) + 1
             try:
@@ -123,7 +182,7 @@ class RouterCore:
     ) -> tuple[str, dict[str, Any]]:
         """
         Retrieves the best available platform and key from a list of candidates.
-        Prioritizes highest `priority`, then caller candidate order, then oldest `last_used_at`.
+        Prioritizes highest `priority`, caller order, least in-flight load, and round-robin.
         """
         now_dt = datetime.datetime.now(datetime.UTC)
         now = now_dt.timestamp()
@@ -146,14 +205,9 @@ class RouterCore:
                 f"No keys configured for candidate platforms: {candidate_platforms}"
             )
 
-        # Prioritize candidates by caller's specified preference order
-        # before sorting by last_used_at
-        platform_order = {p: i for i, p in enumerate(candidate_platforms)}
-        rows.sort(key=lambda r: (-r[3], platform_order.get(r[0], 9999), r[5] or ""))
-
-        # Pass 1: skip keys in cooldown and busy keys
+        valid_rows = []
         for row in rows:
-            platform, key_hash, key_value, _priority, try_after, _, meta = row
+            _, key_hash, _, _, try_after, _, meta = row
 
             if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
                 continue
@@ -170,42 +224,82 @@ class RouterCore:
                     )
                     await self.db.commit()
 
-            if self.is_key_busy(key_hash):
-                continue
+            self.get_key_concurrency_limit(key_hash, meta)
+            valid_rows.append(row)
+
+        if not valid_rows:
+            raise NoKeysAvailableError(
+                f"All keys for candidate platforms {candidate_platforms} are in cooldown."
+            )
+
+        platform_order = {p: i for i, p in enumerate(candidate_platforms)}
+
+        # Pass 1: idle keys (in_flight == 0)
+        idle_rows = [r for r in valid_rows if not self.is_key_busy(r[1])]
+        if idle_rows:
+            idle_rows.sort(key=lambda r: (-r[3], platform_order.get(r[0], 9999), r[5] or ""))
+            top = idle_rows[0]
+            top_rank_candidates = [
+                r
+                for r in idle_rows
+                if r[3] == top[3]
+                and platform_order.get(r[0], 9999) == platform_order.get(top[0], 9999)
+            ]
+            oldest_ts = top_rank_candidates[0][5] or ""
+            same_ts = [r for r in top_rank_candidates if (r[5] or "") == oldest_ts]
+            rr_offset = self._rr_index.get(top[0], 0)
+            selected = same_ts[rr_offset % len(same_ts)]
+            self._rr_index[top[0]] = rr_offset + 1
 
             await self.db.execute(
                 "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
-                (now_dt.isoformat(), key_hash),
+                (now_dt.isoformat(), selected[1]),
             )
             await self.db.commit()
 
-            return platform, {
-                "key_hash": key_hash,
-                "key_value": key_value,
-                "meta": meta,
+            return selected[0], {
+                "key_hash": selected[1],
+                "key_value": selected[2],
+                "meta": selected[6],
             }
 
-        # Pass 2: fallback to busy key if not in cooldown
-        for row in rows:
-            platform, key_hash, key_value, _priority, try_after, _, meta = row
-            if key_hash in self._cooldowns and self._cooldowns[key_hash] > now:
-                continue
+        # Pass 2: fallback to busy keys (least-loaded under capacity first)
+        under_capacity = [r for r in valid_rows if not self.is_key_at_capacity(r[1])]
+        candidates = under_capacity if under_capacity else valid_rows
 
-            await self.db.execute(
-                "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
-                (now_dt.isoformat(), key_hash),
+        candidates.sort(
+            key=lambda r: (
+                -r[3],
+                platform_order.get(r[0], 9999),
+                self.get_in_flight_count(r[1]),
+                r[5] or "",
             )
-            await self.db.commit()
-
-            return platform, {
-                "key_hash": key_hash,
-                "key_value": key_value,
-                "meta": meta,
-            }
-
-        raise NoKeysAvailableError(
-            f"All keys for candidate platforms {candidate_platforms} are in cooldown."
         )
+        top = candidates[0]
+        top_candidates = [
+            r
+            for r in candidates
+            if r[3] == top[3]
+            and platform_order.get(r[0], 9999) == platform_order.get(top[0], 9999)
+            and self.get_in_flight_count(r[1]) == self.get_in_flight_count(top[1])
+        ]
+        oldest_ts = top_candidates[0][5] or ""
+        same_ts = [r for r in top_candidates if (r[5] or "") == oldest_ts]
+        rr_offset = self._rr_index.get(top[0], 0)
+        selected = same_ts[rr_offset % len(same_ts)]
+        self._rr_index[top[0]] = rr_offset + 1
+
+        await self.db.execute(
+            "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
+            (now_dt.isoformat(), selected[1]),
+        )
+        await self.db.commit()
+
+        return selected[0], {
+            "key_hash": selected[1],
+            "key_value": selected[2],
+            "meta": selected[6],
+        }
 
     async def mark_key_exhausted(self, key_hash: str, duration_seconds: float) -> None:
         """Puts a key in cooldown for a specified duration."""
