@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     default_key_concurrency: int = 10
     retry_jitter_min_ms: int = 50
     retry_jitter_max_ms: int = 250
+    sse_keepalive_interval_seconds: float = 3.0
 
 
 settings = Settings()

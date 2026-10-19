@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -5,6 +6,7 @@ import re
 import time
 import typing
 import uuid
+from contextlib import suppress
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -183,6 +185,47 @@ async def _prepare_request_pipeline(
     return candidates, payload_dict, context_length
 
 
+async def with_sse_keepalive(
+    generator: typing.AsyncGenerator[bytes, None],
+    interval: float | None = None,
+) -> typing.AsyncGenerator[bytes, None]:
+    """
+    Wraps an SSE byte stream generator to emit periodic ': keepalive\n\n'
+    comment frames if upstream processing takes longer than interval seconds.
+    """
+    keepalive_interval = (
+        interval if interval is not None else settings.sse_keepalive_interval_seconds
+    )
+    if keepalive_interval <= 0:
+        async for chunk in generator:
+            yield chunk
+        return
+
+    anext_task: asyncio.Task[bytes] | None = None
+    try:
+        while True:
+            if anext_task is None:
+                anext_task = asyncio.create_task(anext(generator))
+
+            done, _ = await asyncio.wait([anext_task], timeout=keepalive_interval)
+            if done:
+                try:
+                    chunk = anext_task.result()
+                    yield chunk
+                    anext_task = None
+                except StopAsyncIteration:
+                    break
+            else:
+                yield b": keepalive\n\n"
+    finally:
+        if anext_task and not anext_task.done():
+            anext_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await anext_task
+        with suppress(Exception):
+            await generator.aclose()
+
+
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_auth)])
 async def chat_completions(fastapi_req: Request, payload: ChatCompletionRequest) -> Response:
     multiplexer: Multiplexer = fastapi_req.app.state.multiplexer
@@ -237,7 +280,7 @@ async def chat_completions(fastapi_req: Request, payload: ChatCompletionRequest)
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(
-        sse_wrapper(),
+        with_sse_keepalive(sse_wrapper()),
         media_type="text/event-stream",
     )
 
@@ -310,7 +353,7 @@ async def anthropic_messages(fastapi_req: Request, payload: AnthropicMessagesReq
             yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n".encode()
 
         return StreamingResponse(
-            sse_anthropic_wrapper(),
+            with_sse_keepalive(sse_anthropic_wrapper()),
             media_type="text/event-stream",
         )
 
