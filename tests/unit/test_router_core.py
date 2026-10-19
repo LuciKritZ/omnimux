@@ -308,3 +308,85 @@ async def test_get_next_key_db_cooldown_pass2(memory_db: aiosqlite.Connection) -
         NoKeysAvailableError, match="All keys for openrouter are currently exhausted"
     ):
         await router.get_next_key("openrouter")
+
+
+@pytest.mark.asyncio
+async def test_router_key_concurrency_limit_meta(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Default limit
+    assert router.get_key_concurrency_limit("hash1") == 10
+
+    # Parse limit from dict meta
+    assert router.get_key_concurrency_limit("hash2", {"max_concurrency": 5}) == 5
+    assert router.get_key_concurrency_limit("hash3", {"concurrency_limit": "3"}) == 3
+
+    # Parse limit from JSON string meta
+    assert router.get_key_concurrency_limit("hash4", '{"max_concurrency": 2}') == 2
+    # Invalid JSON string falls back to default
+    assert router.get_key_concurrency_limit("hash5", "invalid-json") == 10
+    # Invalid int string falls back to default
+    assert router.get_key_concurrency_limit("hash6", {"max_concurrency": "not-an-int"}) == 10
+
+    # is_key_at_capacity
+    router._in_flight["hash4"] = 1
+    assert router.is_key_at_capacity("hash4") is False
+    router._in_flight["hash4"] = 2
+    assert router.is_key_at_capacity("hash4") is True
+
+
+@pytest.mark.asyncio
+async def test_router_round_robin_equal_keys(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Insert two keys with identical priority and last_used_at for test platform
+    await memory_db.execute(
+        """
+        INSERT INTO api_keys (platform, key_hash, key_value, priority, last_used_at)
+        VALUES
+            ('testplat', 'thash1', 'tval1', 1, '2023-01-01T00:00:00+00:00'),
+            ('testplat', 'thash2', 'tval2', 1, '2023-01-01T00:00:00+00:00')
+        """
+    )
+    await memory_db.commit()
+
+    # get_next_key should alternate between thash1 and thash2 via round-robin
+    k1 = await router.get_next_key("testplat")
+    k2 = await router.get_next_key("testplat")
+    assert {k1["key_hash"], k2["key_hash"]} == {"thash1", "thash2"}
+    assert k1["key_hash"] != k2["key_hash"]
+
+    # get_best_platform_and_key should alternate between thash1 and thash2
+    # Reset last_used_at to identical timestamp
+    await memory_db.execute(
+        "UPDATE api_keys SET last_used_at = '2023-01-01T00:00:00+00:00' WHERE platform = 'testplat'"
+    )
+    await memory_db.commit()
+
+    p1, b1 = await router.get_best_platform_and_key(["testplat"])
+    p2, b2 = await router.get_best_platform_and_key(["testplat"])
+    assert p1 == "testplat" and p2 == "testplat"
+    # Even if last_used_at got updated by b1, if they have identical rank they alternate
+    assert b1["key_hash"] != b2["key_hash"]
+
+
+@pytest.mark.asyncio
+async def test_router_least_loaded_selection(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Mark hash2 with in_flight = 3 and hash3 with in_flight = 1
+    router._in_flight["hash1"] = 10
+    router._in_flight["hash2"] = 3
+    router._in_flight["hash3"] = 1
+
+    # Pass 2 should select hash3 as least-loaded among priority 2 keys
+    k = await router.get_next_key("openrouter")
+    assert k["key_hash"] == "hash3"
+
+    p, best = await router.get_best_platform_and_key(["openrouter"])
+    assert p == "openrouter"
+    assert best["key_hash"] == "hash3"
+
+    # If hash3 reaches capacity (e.g. limit 1) and hash2 has capacity
+    router._key_concurrency_limits["hash3"] = 1
+    router._key_concurrency_limits["hash2"] = 5
+    # Now hash3 is at capacity, so hash2 is selected as under capacity
+    k2 = await router.get_next_key("openrouter")
+    assert k2["key_hash"] == "hash2"

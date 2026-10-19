@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import random
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -56,10 +58,25 @@ class Multiplexer:
         router_core: RouterCore,
         http_client: httpx.AsyncClient | None = None,
         platforms_data: dict[str, Any] | None = None,
+        enable_jitter: bool = True,
     ) -> None:
         self.router_core = router_core
         self.http_client = http_client
         self.platforms_data = platforms_data or {}
+        self.enable_jitter = enable_jitter
+
+    async def _sleep_with_jitter(self) -> None:
+        """
+        Applies randomized millisecond jitter backoff before retrying
+        to disperse failover stampedes.
+        """
+        if not self.enable_jitter:
+            return
+        min_ms = max(0, settings.retry_jitter_min_ms)
+        max_ms = max(min_ms, settings.retry_jitter_max_ms)
+        if max_ms > 0:
+            jitter_sec = random.uniform(min_ms, max_ms) / 1000.0
+            await asyncio.sleep(jitter_sec)
 
     async def generate_stream(
         self,
@@ -210,6 +227,7 @@ class Multiplexer:
                     f"Quota exceeded on {platform} key {key_hash}: {e}. Swapping platform..."
                 )
                 await self.router_core.mark_key_exhausted(key_hash, cooldown_sec)
+                await self._sleep_with_jitter()
                 attempts += 1
             except RateLimitError as e:
                 if first_chunk_emitted:
@@ -217,6 +235,7 @@ class Multiplexer:
                 platform_model_index[platform] = current_model_idx + 1
                 logger.warning(f"Rate limit on {platform} key {key_hash}: {e}. Swapping...")
                 await self.router_core.mark_key_exhausted(key_hash, e.retry_after or 60.0)
+                await self._sleep_with_jitter()
                 attempts += 1
             except Exception as e:
                 if first_chunk_emitted:
@@ -226,6 +245,7 @@ class Multiplexer:
                 platform_model_index[platform] = current_model_idx + 1
                 logger.warning(f"Error on {platform} key {key_hash}: {e}. Swapping...")
                 await self.router_core.mark_key_exhausted(key_hash, 60.0)
+                await self._sleep_with_jitter()
                 attempts += 1
 
         # Fallback to Ollama if all attempts exhausted or no keys

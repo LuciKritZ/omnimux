@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     default_cooldown_minutes: int = 60
     image_token_reserve: int = 4096
     proxy_password: str | None = None
+    default_key_concurrency: int = 10
+    retry_jitter_min_ms: int = 50
+    retry_jitter_max_ms: int = 250
 
 
 settings = Settings()

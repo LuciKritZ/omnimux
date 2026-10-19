@@ -143,6 +143,9 @@ Settings can be overridden via environment variables or a local `.env` file:
 PORT=11444
 SQLITE_DB_PATH=omnimux_state.db
 PROXY_PASSWORD=optional_fallback_password
+DEFAULT_KEY_CONCURRENCY=10
+RETRY_JITTER_MIN_MS=50
+RETRY_JITTER_MAX_MS=250
 ```
 
 Legacy `nx_...` keys and existing SQLite states are automatically recognized and supported for backwards compatibility.
