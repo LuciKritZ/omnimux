@@ -10,6 +10,7 @@ from omnimux.services.adapters import (
     AnthropicClient,
     BaseLLMClient,
     OpenAICompatibleClient,
+    _safe_read_error_response,
     is_billing_exhaustion_error,
 )
 
@@ -467,3 +468,29 @@ async def test_anthropic_client_billing_exhaustion_400(
     )
     with pytest.raises(httpx.HTTPStatusError):
         anthropic_client.handle_error(resp_syntax)
+
+
+@pytest.mark.asyncio
+async def test_safe_read_error_response() -> None:
+    # Awaitable aread
+    resp_with_async_read = MagicMock()
+    resp_with_async_read.aread = AsyncMock()
+    await _safe_read_error_response(resp_with_async_read)
+    resp_with_async_read.aread.assert_awaited_once()
+
+    # Non-awaitable aread
+    resp_sync = MagicMock()
+    resp_sync.aread = MagicMock(return_value="not-awaitable")
+    await _safe_read_error_response(resp_sync)
+
+    # Missing aread
+    await _safe_read_error_response(object())
+
+
+@pytest.mark.asyncio
+async def test_base_llm_client_get_client() -> None:
+    mock_http = httpx.AsyncClient()
+    client = OpenAICompatibleClient(api_key="k", client=mock_http)
+    async with client._get_client() as c:
+        assert c is mock_http
+    await mock_http.aclose()
