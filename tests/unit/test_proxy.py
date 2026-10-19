@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncGenerator, Generator
 from typing import Any
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from omnimux.app import create_app
-from omnimux.routes.proxy import verify_auth
+from omnimux.routes.proxy import verify_auth, with_sse_keepalive
 from omnimux.services.db import create_client_key, init_db
 
 
@@ -248,3 +249,153 @@ def test_proxy_image_cache_wires_get_path_for_historical_images(test_client: Tes
             )
             assert res.status_code == 200
             mock_get_path.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_with_sse_keepalive_yields_comments_during_delay() -> None:
+    async def delayed_generator() -> AsyncGenerator[bytes, None]:
+        await asyncio.sleep(0.05)
+        yield b"chunk1"
+        await asyncio.sleep(0.05)
+        yield b"chunk2"
+
+    items = [item async for item in with_sse_keepalive(delayed_generator(), interval=0.02)]
+    # Verify that keepalives were emitted
+    assert b": keepalive\n\n" in items
+    # Verify payload chunks are delivered in order
+    payload_chunks = [item for item in items if item != b": keepalive\n\n"]
+    assert payload_chunks == [b"chunk1", b"chunk2"]
+
+
+@pytest.mark.asyncio
+async def test_with_sse_keepalive_no_delay() -> None:
+    async def fast_generator() -> AsyncGenerator[bytes, None]:
+        yield b"fast1"
+        yield b"fast2"
+
+    items = [item async for item in with_sse_keepalive(fast_generator(), interval=1.0)]
+    assert items == [b"fast1", b"fast2"]
+
+
+@pytest.mark.asyncio
+async def test_with_sse_keepalive_disabled() -> None:
+    async def fast_generator() -> AsyncGenerator[bytes, None]:
+        yield b"direct1"
+        yield b"direct2"
+
+    items = [item async for item in with_sse_keepalive(fast_generator(), interval=0.0)]
+    assert items == [b"direct1", b"direct2"]
+
+
+@pytest.mark.asyncio
+async def test_with_sse_keepalive_exception_propagation() -> None:
+    async def failing_generator() -> AsyncGenerator[bytes, None]:
+        await asyncio.sleep(0.01)
+        raise RuntimeError("upstream stream crashed")
+        yield b"never"  # pragma: no cover
+
+    with pytest.raises(RuntimeError, match="upstream stream crashed"):
+        async for _ in with_sse_keepalive(failing_generator(), interval=0.05):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_with_sse_keepalive_cancellation_and_cleanup() -> None:
+    closed = False
+
+    async def long_generator() -> AsyncGenerator[bytes, None]:
+        nonlocal closed
+        try:
+            yield b"first"
+            await asyncio.sleep(1.0)
+            yield b"second"
+        finally:
+            closed = True
+
+    gen = with_sse_keepalive(long_generator(), interval=0.02)
+    async for item in gen:
+        assert item == b"first"
+        break  # Consumer exits early
+
+    await gen.aclose()
+    assert closed is True
+
+
+@pytest.mark.asyncio
+async def test_with_sse_keepalive_external_task_cancellation() -> None:
+    from contextlib import suppress
+
+    async def infinite_sleep_generator() -> AsyncGenerator[bytes, None]:
+        await asyncio.sleep(100.0)
+        yield b"chunk"  # pragma: no cover
+
+    async def consumer() -> None:
+        async for _ in with_sse_keepalive(infinite_sleep_generator(), interval=0.05):
+            pass
+
+    task = asyncio.create_task(consumer())
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+def test_chat_completions_streaming_with_keepalive(
+    test_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnimux.config import settings
+
+    monkeypatch.setattr(settings, "sse_keepalive_interval_seconds", 0.02)
+
+    with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
+
+        async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            await asyncio.sleep(0.05)
+            yield "thinking token"
+
+        mock_stream.return_value = mock_gen()
+
+        res = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "stream": True,
+                "messages": [{"role": "user", "content": "solve a puzzle"}],
+            },
+        )
+        assert res.status_code == 200
+        text = res.text
+        assert ": keepalive\n\n" in text
+        assert "thinking token" in text
+        assert "data: [DONE]\n\n" in text
+
+
+def test_anthropic_messages_streaming_with_keepalive(
+    test_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnimux.config import settings
+
+    monkeypatch.setattr(settings, "sse_keepalive_interval_seconds", 0.02)
+
+    with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
+
+        async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            await asyncio.sleep(0.05)
+            yield "reasoning token"
+
+        mock_stream.return_value = mock_gen()
+
+        res = test_client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-3-7-sonnet-20250219",
+                "stream": True,
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "deep thinking prompt"}],
+            },
+        )
+        assert res.status_code == 200
+        text = res.text
+        assert ": keepalive\n\n" in text
+        assert "reasoning token" in text
+        assert "event: message_stop" in text
