@@ -6,7 +6,12 @@ import httpx
 import pytest
 
 from omnimux.exceptions import QuotaExceededError, RateLimitError
-from omnimux.services.adapters import AnthropicClient, BaseLLMClient, OpenAICompatibleClient
+from omnimux.services.adapters import (
+    AnthropicClient,
+    BaseLLMClient,
+    OpenAICompatibleClient,
+    is_billing_exhaustion_error,
+)
 
 
 @pytest.fixture
@@ -368,3 +373,97 @@ async def test_anthropic_client_thinking_and_partial_json() -> None:
         assert "Let me think." in chunks
         assert '{"arg": 1}' in chunks
         assert "Done" in chunks
+
+
+def test_is_billing_exhaustion_error_patterns() -> None:
+    req = httpx.Request("POST", "https://api.test")
+
+    # 402 and 403 are always billing/quota errors
+    assert is_billing_exhaustion_error(httpx.Response(402, request=req)) is True
+    assert is_billing_exhaustion_error(httpx.Response(403, request=req)) is True
+
+    # 500 or non-400 are not billing exhaustion
+    assert is_billing_exhaustion_error(httpx.Response(500, request=req)) is False
+
+    # 400 with billing keywords
+    resp_anthropic = httpx.Response(
+        400,
+        request=req,
+        text=(
+            '{"type": "error", "error": {"type": "invalid_request_error", '
+            '"message": "credit balance is too low"}}'
+        ),
+    )
+    assert is_billing_exhaustion_error(resp_anthropic) is True
+
+    resp_openai = httpx.Response(
+        400,
+        request=req,
+        text=(
+            '{"error": {"code": "billing_hard_limit_reached", '
+            '"message": "Billing hard limit reached"}}'
+        ),
+    )
+    assert is_billing_exhaustion_error(resp_openai) is True
+
+    # 400 syntax error without billing keywords
+    resp_syntax = httpx.Response(
+        400,
+        request=req,
+        text='{"error": {"message": "Invalid parameter: max_tokens must be positive"}}',
+    )
+    assert is_billing_exhaustion_error(resp_syntax) is False
+
+    # Test error decoding fallback when .text raises exception
+    class BrokenResponse:
+        status_code = 400
+
+        @property
+        def text(self) -> str:
+            raise RuntimeError("Unreadable response body")
+
+    assert is_billing_exhaustion_error(BrokenResponse()) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_openai_client_billing_exhaustion_400(
+    openai_client: OpenAICompatibleClient,
+) -> None:
+    req = httpx.Request("POST", "https://api.test")
+    resp_billing = httpx.Response(
+        400,
+        request=req,
+        text='{"error": {"message": "You exceeded your current quota, please check your plan."}}',
+    )
+    with pytest.raises(QuotaExceededError, match="Quota exceeded or unauthorized"):
+        openai_client.handle_error(resp_billing)
+
+    resp_syntax = httpx.Response(
+        400,
+        request=req,
+        text='{"error": {"message": "Invalid temperature value."}}',
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        openai_client.handle_error(resp_syntax)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_client_billing_exhaustion_400(
+    anthropic_client: AnthropicClient,
+) -> None:
+    req = httpx.Request("POST", "https://api.anthropic.com")
+    resp_billing = httpx.Response(
+        400,
+        request=req,
+        text='{"error": {"message": "Your credit balance is too low to access the Claude API."}}',
+    )
+    with pytest.raises(QuotaExceededError, match="Anthropic Quota Exceeded"):
+        anthropic_client.handle_error(resp_billing)
+
+    resp_syntax = httpx.Response(
+        400,
+        request=req,
+        text='{"error": {"message": "Messages array cannot be empty."}}',
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        anthropic_client.handle_error(resp_syntax)

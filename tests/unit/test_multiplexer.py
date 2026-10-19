@@ -1,9 +1,10 @@
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
-from omnimux.exceptions import RateLimitError
+from omnimux.exceptions import QuotaExceededError, RateLimitError
 from omnimux.services.multiplexer import Multiplexer
 from omnimux.services.router_core import NoKeysAvailableError
 
@@ -562,5 +563,58 @@ async def test_multiplexer_idempotency_after_first_chunk(
         await anext(stream)
 
     # Secondary failover or mark_exhausted was not invoked
+    assert mock_router.get_best_platform_and_key.call_count == 1
+    mock_router.mark_key_exhausted.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_failover_on_quota_exceeded_billing_400(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    mock_router.get_best_platform_and_key.side_effect = [
+        ("anthropic", {"key_hash": "h1", "key_value": "v1"}),
+        ("anthropic", {"key_hash": "h2", "key_value": "v2"}),
+    ]
+
+    client1 = MagicMock()
+    # Simulates adapter translating HTTP 400 into QuotaExceededError
+    client1.generate_stream.return_value = MockStreamGen(
+        [QuotaExceededError("credit balance is too low")]
+    )
+    client2 = MagicMock()
+    client2.generate_stream.return_value = MockStreamGen(["backup_token"])
+    mock_get_client.side_effect = [client1, client2]
+
+    multiplexer = Multiplexer(mock_router, enable_jitter=False)
+    chunks = [c async for c in multiplexer.generate_stream(["anthropic/claude-3-5-sonnet"], [])]
+
+    assert chunks == ["backup_token"]
+    assert mock_router.get_best_platform_and_key.call_count == 2
+    mock_router.mark_key_exhausted.assert_called_once_with("h1", 3600.0)
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_aborts_immediately_on_syntax_400(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    mock_router.get_best_platform_and_key.return_value = (
+        "anthropic",
+        {"key_hash": "h1", "key_value": "v1"},
+    )
+
+    req = httpx.Request("POST", "https://api.anthropic.com")
+    resp = httpx.Response(400, request=req, text='{"error": "Invalid parameter: max_tokens"}')
+    syntax_error = httpx.HTTPStatusError("400 Bad Request", request=req, response=resp)
+
+    client1 = MagicMock()
+    client1.generate_stream.return_value = MockStreamGen([syntax_error])
+    mock_get_client.return_value = client1
+
+    multiplexer = Multiplexer(mock_router, enable_jitter=False)
+    with pytest.raises(httpx.HTTPStatusError):
+        _ = [c async for c in multiplexer.generate_stream(["anthropic/claude-3-5-sonnet"], [])]
+
     assert mock_router.get_best_platform_and_key.call_count == 1
     mock_router.mark_key_exhausted.assert_not_called()

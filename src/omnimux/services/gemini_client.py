@@ -7,7 +7,11 @@ from typing import Any
 import httpx
 
 from omnimux.exceptions import GeminiAPIError, QuotaExceededError, RateLimitError
-from omnimux.services.adapters import BaseLLMClient
+from omnimux.services.adapters import (
+    BaseLLMClient,
+    _safe_read_error_response,
+    is_billing_exhaustion_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +93,7 @@ class GeminiClient(BaseLLMClient):
                     timeout=30.0,
                 ) as response:
                     if response.status_code != 200:
+                        await _safe_read_error_response(response)
                         self.handle_error(response)
 
                     async for line in response.aiter_lines():
@@ -139,6 +144,6 @@ class GeminiClient(BaseLLMClient):
             except ValueError:
                 retry_after = 60.0
             raise RateLimitError("Gemini Rate Limited", retry_after=retry_after)
-        if response.status_code in (402, 403):
+        if response.status_code in (402, 403) or is_billing_exhaustion_error(response):
             raise QuotaExceededError("Gemini Quota Exceeded")
         response.raise_for_status()

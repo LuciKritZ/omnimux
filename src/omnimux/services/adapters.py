@@ -1,4 +1,5 @@
 import abc
+import inspect
 import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -7,6 +8,46 @@ from typing import Any
 import httpx
 
 from omnimux.exceptions import QuotaExceededError, RateLimitError
+
+BILLING_EXHAUSTION_PATTERNS = (
+    "credit balance is too low",
+    "credit_balance_too_low",
+    "insufficient_credits",
+    "billing_hard_limit_reached",
+    "insufficient_quota",
+    "exceeded your current quota",
+    "quota_exceeded",
+    "out of credits",
+    "account_deactivated",
+    "resource_exhausted",
+    "insufficient funds",
+    "payment required",
+    "purchase credits",
+)
+
+
+def is_billing_exhaustion_error(response: httpx.Response) -> bool:
+    """Detects whether an HTTP error indicates account or credit exhaustion."""
+    if response.status_code in (402, 403):
+        return True
+    if response.status_code != 400:
+        return False
+
+    try:
+        body = response.text.lower()
+    except Exception:
+        return False
+
+    return any(p in body for p in BILLING_EXHAUSTION_PATTERNS)
+
+
+async def _safe_read_error_response(response: Any) -> None:
+    """Safely reads the response body if aread is available and awaitable."""
+    aread_fn = getattr(response, "aread", None)
+    if callable(aread_fn):
+        res = aread_fn()
+        if inspect.isawaitable(res):
+            await res
 
 
 class BaseLLMClient(abc.ABC):
@@ -71,6 +112,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             ) as response,
         ):
             if response.status_code != 200:
+                await _safe_read_error_response(response)
                 self.handle_error(response)
 
             async for line in response.aiter_lines():
@@ -95,8 +137,8 @@ class OpenAICompatibleClient(BaseLLMClient):
                 retry_after = 60.0
             raise RateLimitError(f"Rate limited by {self.base_url}", retry_after=retry_after)
 
-        if response.status_code in (402, 403):
-            # 402 is standard for Insufficient Quota (e.g. OpenRouter). Some use 403.
+        if response.status_code in (402, 403) or is_billing_exhaustion_error(response):
+            # 402 is standard for Insufficient Quota; some providers return 403 or 400.
             raise QuotaExceededError(f"Quota exceeded or unauthorized for {self.base_url}")
 
         # Fallback for generic errors
@@ -156,6 +198,7 @@ class AnthropicClient(BaseLLMClient):
             ) as response,
         ):
             if response.status_code != 200:
+                await _safe_read_error_response(response)
                 self.handle_error(response)
 
             async for line in response.aiter_lines():
@@ -188,7 +231,7 @@ class AnthropicClient(BaseLLMClient):
                 retry_after = 60.0
             raise RateLimitError("Anthropic Rate Limited", retry_after=retry_after)
 
-        if response.status_code in (401, 403):
+        if response.status_code in (401, 403) or is_billing_exhaustion_error(response):
             raise QuotaExceededError("Anthropic Quota Exceeded or Unauthorized")
 
         response.raise_for_status()
