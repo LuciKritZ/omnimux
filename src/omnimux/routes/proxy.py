@@ -235,7 +235,11 @@ def extract_session_id(request: Request, messages: list[typing.Any]) -> str:
             return val.strip()
 
     # Fallback deterministic session hash based on client auth and root message
-    auth_header = request.headers.get("authorization") or request.headers.get("x-api-key") or ""
+    auth_header = (
+        request.headers.get("authorization")
+        or request.headers.get("x-api-key")
+        or (request.client.host if request.client and request.client.host else "")
+    )
     first_msg_str = ""
     if messages:
         first = messages[0]

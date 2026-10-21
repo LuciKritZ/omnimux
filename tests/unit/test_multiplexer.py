@@ -60,7 +60,7 @@ async def test_multiplexer_success(mock_get_client: MagicMock, mock_router: Magi
     chunks = [c async for c in multiplexer.generate_stream(["openrouter/model"], [])]
 
     assert chunks == ["chunk1", "chunk2"]
-    mock_router.get_best_platform_and_key.assert_called_once_with(["openrouter"])
+    mock_router.get_best_platform_and_key.assert_called_once_with(["openrouter"], session_id=None)
     mock_router.mark_key_exhausted.assert_not_called()
 
 

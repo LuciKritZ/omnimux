@@ -437,6 +437,15 @@ def test_extract_session_id_variants() -> None:
     sess_prim = extract_session_id(Request(scope_none), ["raw string turn"])
     assert sess_prim.startswith("sess_")
 
+    # 6. Fallback with client IP when auth is missing
+    scope_ip = {
+        "type": "http",
+        "headers": [],
+        "client": ("192.168.1.50", 12345),
+    }
+    sess_ip = extract_session_id(Request(scope_ip), [])
+    assert sess_ip.startswith("sess_")
+
 
 def test_proxy_chat_completions_cache_usage(test_client: TestClient) -> None:
     with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:

@@ -51,9 +51,23 @@ class RouterCore:
         key_hash: str,
         ttl_seconds: float | None = None,
     ) -> None:
-        """Binds a session to a specific platform and key_hash with TTL."""
+        """Binds a session to a specific platform and key_hash with TTL and capacity bounding."""
         ttl = ttl_seconds if ttl_seconds is not None else settings.session_affinity_ttl_seconds
         now = datetime.datetime.now(datetime.UTC).timestamp()
+
+        if (
+            len(self._session_affinity) >= settings.max_session_affinity_entries
+            and session_id not in self._session_affinity
+        ):
+            expired_keys = [s for s, (_, _, exp) in self._session_affinity.items() if exp < now]
+            for s in expired_keys:
+                self._session_affinity.pop(s, None)
+            if len(self._session_affinity) >= settings.max_session_affinity_entries:
+                oldest_sess = min(
+                    self._session_affinity, key=lambda s: self._session_affinity[s][2]
+                )
+                self._session_affinity.pop(oldest_sess, None)
+
         self._session_affinity[session_id] = (platform, key_hash, now + ttl)
 
     def evict_session_affinity(self, session_id: str) -> None:

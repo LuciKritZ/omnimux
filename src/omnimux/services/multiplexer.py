@@ -147,14 +147,9 @@ class Multiplexer:
 
         while attempts < max_retries and candidate_platforms:
             try:
-                if session_id:
-                    platform, key_info = await self.router_core.get_best_platform_and_key(
-                        candidate_platforms, session_id=session_id
-                    )
-                else:
-                    platform, key_info = await self.router_core.get_best_platform_and_key(
-                        candidate_platforms
-                    )
+                platform, key_info = await self.router_core.get_best_platform_and_key(
+                    candidate_platforms, session_id=session_id
+                )
             except NoKeysAvailableError:
                 logger.warning(f"No keys available for any of {candidate_platforms}. Falling back.")
                 break

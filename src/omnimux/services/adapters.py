@@ -106,6 +106,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         self.last_usage = {}
+        usage_sink = kwargs.get("usage_sink")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -115,7 +116,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             "model": model,
             "messages": messages,
             "stream": True,
-            **kwargs,
+            **{k: v for k, v in kwargs.items() if k != "usage_sink"},
         }
 
         async with (
@@ -136,10 +137,15 @@ class OpenAICompatibleClient(BaseLLMClient):
                             for k, v in data["usage"].items():
                                 if isinstance(v, (int, float)):
                                     self.last_usage[k] = int(v)
+                                    if isinstance(usage_sink, dict):
+                                        usage_sink[k] = int(v)
                                 elif isinstance(v, dict):
                                     for sub_k, sub_v in v.items():
                                         if isinstance(sub_v, (int, float)):
-                                            self.last_usage[f"{k}_{sub_k}"] = int(sub_v)
+                                            key_name = f"{k}_{sub_k}"
+                                            self.last_usage[key_name] = int(sub_v)
+                                            if isinstance(usage_sink, dict):
+                                                usage_sink[key_name] = int(sub_v)
                         content = data.get("choices", [{}])[0].get("delta", {}).get("content")
                         if content:
                             yield content
@@ -176,6 +182,7 @@ class AnthropicClient(BaseLLMClient):
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         self.last_usage = {}
+        usage_sink = kwargs.get("usage_sink")
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -234,6 +241,7 @@ class AnthropicClient(BaseLLMClient):
                 "system",
                 "anthropic_beta",
                 "anthropic-beta",
+                "usage_sink",
             ]:
                 payload[k] = v
 
@@ -272,12 +280,16 @@ class AnthropicClient(BaseLLMClient):
                                 for uk, uv in usage.items():
                                     if isinstance(uv, (int, float)):
                                         self.last_usage[uk] = int(uv)
+                                        if isinstance(usage_sink, dict):
+                                            usage_sink[uk] = int(uv)
                         elif data.get("type") == "message_delta":
                             usage = data.get("usage", {})
                             if isinstance(usage, dict):
                                 for uk, uv in usage.items():
                                     if isinstance(uv, (int, float)):
                                         self.last_usage[uk] = int(uv)
+                                        if isinstance(usage_sink, dict):
+                                            usage_sink[uk] = int(uv)
                         elif data.get("type") == "content_block_delta":
                             delta = data.get("delta", {})
                             content = (

@@ -573,14 +573,18 @@ async def test_anthropic_client_cache_control_and_usage(
         ]
 
         chunks = []
+        usage_sink: dict[str, Any] = {}
         async for chunk in anthropic_client.generate_stream(
             model="claude-3-7-sonnet-20250219",
             messages=messages,
             anthropic_beta="interleaved-thinking-2025-02-19",
+            usage_sink=usage_sink,
         ):
             chunks.append(chunk)
 
         assert "".join(chunks) == "Cached response"
+        assert usage_sink["cache_creation_input_tokens"] == 80
+        assert usage_sink["cache_read_input_tokens"] == 70
         # Beta header appended
         captured_headers: dict[str, str] = captured_request["headers"]
         captured_json: dict[str, Any] = captured_request["json"]
@@ -721,11 +725,15 @@ async def test_openai_client_usage_stream(openai_client: OpenAICompatibleClient)
 
         mock_stream.return_value = AsyncContextManager()
 
+        sink: dict[str, Any] = {}
         async for chunk in openai_client.generate_stream(
-            "gpt-4o", [{"role": "user", "content": "hi"}]
+            "gpt-4o", [{"role": "user", "content": "hi"}], usage_sink=sink
         ):
             assert chunk == "Hello"
 
         assert openai_client.last_usage["prompt_tokens"] == 10
         assert openai_client.last_usage["completion_tokens"] == 5
         assert openai_client.last_usage["prompt_tokens_details_cached_tokens"] == 8
+        assert sink["prompt_tokens"] == 10
+        assert sink["completion_tokens"] == 5
+        assert sink["prompt_tokens_details_cached_tokens"] == 8

@@ -510,3 +510,30 @@ async def test_router_session_affinity_stale_key_eviction(memory_db: aiosqlite.C
     aff2 = router.get_session_affinity("stale2")
     assert aff2 is not None
     assert aff2[0] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_session_affinity_capacity_bounding(
+    memory_db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnimux.config import settings
+
+    monkeypatch.setattr(settings, "max_session_affinity_entries", 2)
+
+    router = RouterCore(memory_db)
+    # Add 2 entries, one expired, one active
+    router.set_session_affinity("s_expired", "openrouter", "hash1", ttl_seconds=-10.0)
+    router.set_session_affinity("s_active", "openrouter", "hash2", ttl_seconds=100.0)
+
+    # Adding a 3rd should purge expired entry
+    router.set_session_affinity("s_new", "openrouter", "hash3", ttl_seconds=100.0)
+    assert len(router._session_affinity) == 2
+    assert "s_expired" not in router._session_affinity
+    assert "s_active" in router._session_affinity
+    assert "s_new" in router._session_affinity
+
+    # Adding a 4th with all active should evict oldest
+    router.set_session_affinity("s_newest", "openrouter", "hash4", ttl_seconds=200.0)
+    assert len(router._session_affinity) == 2
+    assert "s_active" not in router._session_affinity
+    assert "s_newest" in router._session_affinity
