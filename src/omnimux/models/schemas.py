@@ -9,15 +9,21 @@ class ImageUrl(BaseModel):
 
 
 class ContentBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: Literal["text", "image_url"]
     text: str | None = None
     image_url: ImageUrl | None = None
+    cache_control: dict[str, Any] | None = None
 
 
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     role: str
     content: str | list[ContentBlock]
     name: str | None = None
+    cache_control: dict[str, Any] | None = None
 
     def __getitem__(self, item: str) -> Any:
         return getattr(self, item)
@@ -40,6 +46,7 @@ class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: str
     content: str | list[Any]
+    cache_control: dict[str, Any] | None = None
 
 
 class AnthropicMessagesRequest(BaseModel):
@@ -64,28 +71,51 @@ def convert_anthropic_to_chat_completion(
         if isinstance(req.system, str):
             chat_messages.append(ChatMessage(role="system", content=req.system))
         elif isinstance(req.system, list):
-            sys_text = "\n".join(
-                b.get("text", "")
-                for b in req.system
-                if isinstance(b, dict) and b.get("type") == "text"
+            has_cache_control = any(
+                isinstance(b, dict) and b.get("cache_control") is not None for b in req.system
             )
-            if sys_text:
-                chat_messages.append(ChatMessage(role="system", content=sys_text))
+            if has_cache_control:
+                sys_blocks = [
+                    ContentBlock(
+                        type="text",
+                        text=b.get("text", ""),
+                        cache_control=b.get("cache_control"),
+                    )
+                    for b in req.system
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                if sys_blocks:
+                    chat_messages.append(ChatMessage(role="system", content=sys_blocks))
+            else:
+                sys_text = "\n".join(
+                    b.get("text", "")
+                    for b in req.system
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+                if sys_text:
+                    chat_messages.append(ChatMessage(role="system", content=sys_text))
 
     for msg in req.messages:
         role = msg.role
         content = msg.content
+        msg_cc = getattr(msg, "cache_control", None)
         if isinstance(content, str):
-            chat_messages.append(ChatMessage(role=role, content=content))
+            chat_messages.append(ChatMessage(role=role, content=content, cache_control=msg_cc))
         elif isinstance(content, list):
             blocks: list[ContentBlock] = []
             has_image = False
+            has_cache_control = msg_cc is not None
             for item in content:
                 if not isinstance(item, dict):
                     continue
                 item_type = item.get("type")
+                cc = item.get("cache_control")
+                if cc is not None:
+                    has_cache_control = True
                 if item_type == "text":
-                    blocks.append(ContentBlock(type="text", text=item.get("text", "")))
+                    blocks.append(
+                        ContentBlock(type="text", text=item.get("text", ""), cache_control=cc)
+                    )
                 elif item_type == "image":
                     has_image = True
                     source = item.get("source", {})
@@ -95,12 +125,19 @@ def convert_anthropic_to_chat_completion(
                         ContentBlock(
                             type="image_url",
                             image_url=ImageUrl(url=f"data:{media_type};base64,{data}"),
+                            cache_control=cc,
                         )
                     )
                 elif item_type == "tool_use":
                     name = item.get("name", "")
                     inp = json.dumps(item.get("input", {}))
-                    blocks.append(ContentBlock(type="text", text=f"[Tool use: {name} input={inp}]"))
+                    blocks.append(
+                        ContentBlock(
+                            type="text",
+                            text=f"[Tool use: {name} input={inp}]",
+                            cache_control=cc,
+                        )
+                    )
                 elif item_type == "tool_result":
                     res_content = item.get("content", "")
                     if isinstance(res_content, list):
@@ -111,13 +148,21 @@ def convert_anthropic_to_chat_completion(
                         )
                     else:
                         res_text = str(res_content)
-                    blocks.append(ContentBlock(type="text", text=f"[Tool result: {res_text}]"))
+                    blocks.append(
+                        ContentBlock(
+                            type="text",
+                            text=f"[Tool result: {res_text}]",
+                            cache_control=cc,
+                        )
+                    )
 
-            if has_image:
-                chat_messages.append(ChatMessage(role=role, content=blocks))
+            if has_image or has_cache_control:
+                chat_messages.append(ChatMessage(role=role, content=blocks, cache_control=msg_cc))
             else:
                 combined_text = "\n".join(b.text or "" for b in blocks if b.text)
-                chat_messages.append(ChatMessage(role=role, content=combined_text))
+                chat_messages.append(
+                    ChatMessage(role=role, content=combined_text, cache_control=msg_cc)
+                )
 
     return ChatCompletionRequest(
         model=req.model,

@@ -390,3 +390,150 @@ async def test_router_least_loaded_selection(memory_db: aiosqlite.Connection) ->
     # Now hash3 is at capacity, so hash2 is selected as under capacity
     k2 = await router.get_next_key("openrouter")
     assert k2["key_hash"] == "hash2"
+
+
+@pytest.mark.asyncio
+async def test_session_affinity_lifecycle(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+
+    # 1. Unknown session returns None
+    assert router.get_session_affinity("unknown") is None
+
+    # 2. Set affinity and get it
+    router.set_session_affinity("sess1", "openrouter", "hash2", ttl_seconds=100.0)
+    aff = router.get_session_affinity("sess1")
+    assert aff is not None
+    assert aff[0] == "openrouter"
+    assert aff[1] == "hash2"
+
+    # 3. Expired affinity returns None and cleans up
+    router.set_session_affinity("sess2", "openrouter", "hash2", ttl_seconds=-10.0)
+    assert router.get_session_affinity("sess2") is None
+    assert "sess2" not in router._session_affinity
+
+    # 4. Explicit eviction
+    router.evict_session_affinity("sess1")
+    assert router.get_session_affinity("sess1") is None
+
+    # 5. Evict affinities for key
+    router.set_session_affinity("sessA", "openrouter", "hash2")
+    router.set_session_affinity("sessB", "openrouter", "hash3")
+    router.evict_affinities_for_key("hash2")
+    assert router.get_session_affinity("sessA") is None
+    assert router.get_session_affinity("sessB") is not None
+
+
+@pytest.mark.asyncio
+async def test_router_best_platform_session_affinity(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+
+    # First turn: selects best key (hash2) and binds sess1 to it
+    p1, k1 = await router.get_best_platform_and_key(["openrouter"], session_id="sess1")
+    assert p1 == "openrouter"
+    assert k1["key_hash"] == "hash2"
+
+    # Second turn without session_id: round-robin might switch or pick another key
+    # But with session_id="sess1": MUST return hash2 again!
+    p2, k2 = await router.get_best_platform_and_key(["openrouter"], session_id="sess1")
+    assert p2 == "openrouter"
+    assert k2["key_hash"] == "hash2"
+
+    # Turn with session_id="sess2": binds to a new key
+    p3, _ = await router.get_best_platform_and_key(["openrouter"], session_id="sess2")
+    assert p3 == "openrouter"
+
+    # If bound key is marked exhausted, session affinity is cleared immediately
+    await router.mark_key_exhausted("hash2", duration_seconds=3600.0)
+    assert router.get_session_affinity("sess1") is None
+
+    # Subsequent call with sess1 seamlessly routes to the next healthy key (hash3)
+    p4, k4 = await router.get_best_platform_and_key(["openrouter"], session_id="sess1")
+    assert p4 == "openrouter"
+    assert k4["key_hash"] == "hash3"
+
+
+@pytest.mark.asyncio
+async def test_router_get_next_key_session_affinity(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+
+    k1 = await router.get_next_key("openrouter", session_id="s1")
+    assert k1["key_hash"] == "hash2"
+
+    # Successive call returns same key
+    k2 = await router.get_next_key("openrouter", session_id="s1")
+    assert k2["key_hash"] == "hash2"
+
+    # If key is exhausted, session affinity evicted and fallback picked
+    await router.mark_key_exhausted("hash2", 3600.0)
+    k3 = await router.get_next_key("openrouter", session_id="s1")
+    assert k3["key_hash"] == "hash3"
+
+
+@pytest.mark.asyncio
+async def test_router_session_affinity_pass2_busy_keys(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Mark all keys busy so Pass 1 is skipped
+    router._in_flight["hash1"] = 1
+    router._in_flight["hash2"] = 1
+    router._in_flight["hash3"] = 1
+    router._in_flight["hash4"] = 1
+
+    # 1. get_next_key Pass 2 with session_id sets affinity
+    k = await router.get_next_key("openrouter", session_id="busy_sess_1")
+    assert k["key_hash"] in ("hash2", "hash3")
+    aff1 = router.get_session_affinity("busy_sess_1")
+    assert aff1 is not None
+    assert aff1[1] == k["key_hash"]
+
+    # 2. get_best_platform_and_key Pass 2 with session_id sets affinity
+    p, best = await router.get_best_platform_and_key(["openrouter"], session_id="busy_sess_2")
+    assert p == "openrouter"
+    aff2 = router.get_session_affinity("busy_sess_2")
+    assert aff2 is not None
+    assert aff2[1] == best["key_hash"]
+
+
+@pytest.mark.asyncio
+async def test_router_session_affinity_stale_key_eviction(memory_db: aiosqlite.Connection) -> None:
+    router = RouterCore(memory_db)
+    # Set affinity to key not in valid rows
+    router.set_session_affinity("stale1", "openrouter", "deleted_key_hash")
+    k = await router.get_next_key("openrouter", session_id="stale1")
+    assert k["key_hash"] != "deleted_key_hash"
+    aff1 = router.get_session_affinity("stale1")
+    assert aff1 is not None
+    assert aff1[1] == k["key_hash"]
+
+    router.set_session_affinity("stale2", "gemini", "deleted_gemini_hash")
+    p, _ = await router.get_best_platform_and_key(["openrouter"], session_id="stale2")
+    assert p == "openrouter"
+    aff2 = router.get_session_affinity("stale2")
+    assert aff2 is not None
+    assert aff2[0] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_session_affinity_capacity_bounding(
+    memory_db: aiosqlite.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnimux.config import settings
+
+    monkeypatch.setattr(settings, "max_session_affinity_entries", 2)
+
+    router = RouterCore(memory_db)
+    # Add 2 entries, one expired, one active
+    router.set_session_affinity("s_expired", "openrouter", "hash1", ttl_seconds=-10.0)
+    router.set_session_affinity("s_active", "openrouter", "hash2", ttl_seconds=100.0)
+
+    # Adding a 3rd should purge expired entry
+    router.set_session_affinity("s_new", "openrouter", "hash3", ttl_seconds=100.0)
+    assert len(router._session_affinity) == 2
+    assert "s_expired" not in router._session_affinity
+    assert "s_active" in router._session_affinity
+    assert "s_new" in router._session_affinity
+
+    # Adding a 4th with all active should evict oldest
+    router.set_session_affinity("s_newest", "openrouter", "hash4", ttl_seconds=200.0)
+    assert len(router._session_affinity) == 2
+    assert "s_active" not in router._session_affinity
+    assert "s_newest" in router._session_affinity

@@ -82,6 +82,8 @@ class Multiplexer:
         self,
         candidate_models: list[str],
         messages: list[dict[str, Any]],
+        session_id: str | None = None,
+        usage_sink: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
         """
@@ -96,6 +98,8 @@ class Multiplexer:
             ollama_client = get_client_for_platform("ollama", "", self.http_client, fallback_url)
             async for chunk in ollama_client.generate_stream(fallback_model, messages, **kwargs):
                 yield chunk
+            if usage_sink is not None and hasattr(ollama_client, "last_usage"):
+                usage_sink.update(ollama_client.last_usage)
             return
 
         # Map platforms to their corresponding target models from the candidates list
@@ -128,6 +132,8 @@ class Multiplexer:
                 )
                 async for chunk in ollama_client.generate_stream(m, messages, **kwargs):
                     yield chunk
+                if usage_sink is not None and hasattr(ollama_client, "last_usage"):
+                    usage_sink.update(ollama_client.last_usage)
                 return
 
             if p not in platform_to_models:
@@ -142,7 +148,7 @@ class Multiplexer:
         while attempts < max_retries and candidate_platforms:
             try:
                 platform, key_info = await self.router_core.get_best_platform_and_key(
-                    candidate_platforms
+                    candidate_platforms, session_id=session_id
                 )
             except NoKeysAvailableError:
                 logger.warning(f"No keys available for any of {candidate_platforms}. Falling back.")
@@ -208,6 +214,8 @@ class Multiplexer:
                     try:
                         first_chunk = await anext(stream_gen)
                     except StopAsyncIteration:
+                        if usage_sink is not None and hasattr(client, "last_usage"):
+                            usage_sink.update(client.last_usage)
                         return
 
                     first_chunk_emitted = True
@@ -215,6 +223,9 @@ class Multiplexer:
 
                     async for chunk in stream_gen:
                         yield chunk
+
+                    if usage_sink is not None and hasattr(client, "last_usage"):
+                        usage_sink.update(client.last_usage)
 
                     return
 
@@ -257,3 +268,5 @@ class Multiplexer:
         ollama_client = get_client_for_platform("ollama", "", self.http_client, fallback_url)
         async for chunk in ollama_client.generate_stream(fallback_model, messages, **kwargs):
             yield chunk
+        if usage_sink is not None and hasattr(ollama_client, "last_usage"):
+            usage_sink.update(ollama_client.last_usage)

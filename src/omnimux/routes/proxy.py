@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -226,23 +227,64 @@ async def with_sse_keepalive(
             await generator.aclose()
 
 
+def extract_session_id(request: Request, messages: list[typing.Any]) -> str:
+    """Extracts explicit session id from client headers or derives a deterministic one."""
+    for h in ("x-session-id", "x-conversation-id", "session-id", "anthropic-session-id"):
+        val = request.headers.get(h)
+        if val:
+            return val.strip()
+
+    # Fallback deterministic session hash based on client auth and root message
+    auth_header = (
+        request.headers.get("authorization")
+        or request.headers.get("x-api-key")
+        or (request.client.host if request.client and request.client.host else "")
+    )
+    first_msg_str = ""
+    if messages:
+        first = messages[0]
+        if hasattr(first, "content"):
+            first_msg_str = str(first.content)
+        elif isinstance(first, dict):
+            first_msg_str = str(first.get("content", ""))
+        else:
+            first_msg_str = str(first)
+
+    seed = f"{auth_header}:{first_msg_str}".encode()
+    return f"sess_{hashlib.sha256(seed).hexdigest()[:16]}"
+
+
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_auth)])
 async def chat_completions(fastapi_req: Request, payload: ChatCompletionRequest) -> Response:
     multiplexer: Multiplexer = fastapi_req.app.state.multiplexer
     candidates, payload_dict, context_length = await _prepare_request_pipeline(payload, fastapi_req)
     extra_kwargs = {k: v for k, v in payload_dict.items() if k not in ("model", "messages")}
+    session_id = extract_session_id(fastapi_req, payload.messages)
+    usage_sink: dict[str, typing.Any] = {}
 
     if not payload.stream:
         content_parts: list[str] = []
         async for chunk in multiplexer.generate_stream(
             candidate_models=candidates,
             messages=payload_dict.get("messages", []),
+            session_id=session_id,
+            usage_sink=usage_sink,
             **extra_kwargs,
         ):
             content_parts.append(chunk)
 
         full_content = "".join(content_parts)
-        completion_response = {
+        prompt_toks = (
+            usage_sink.get("input_tokens")
+            or usage_sink.get("prompt_tokens")
+            or max(1, context_length)
+        )
+        comp_toks = (
+            usage_sink.get("output_tokens")
+            or usage_sink.get("completion_tokens")
+            or max(1, len(full_content) // 4)
+        )
+        completion_response: dict[str, typing.Any] = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
             "created": int(time.time()),
@@ -258,17 +300,27 @@ async def chat_completions(fastapi_req: Request, payload: ChatCompletionRequest)
                 }
             ],
             "usage": {
-                "prompt_tokens": max(1, context_length),
-                "completion_tokens": max(1, len(full_content) // 4),
-                "total_tokens": max(1, context_length) + max(1, len(full_content) // 4),
+                "prompt_tokens": prompt_toks,
+                "completion_tokens": comp_toks,
+                "total_tokens": prompt_toks + comp_toks,
             },
         }
+        if "cache_creation_input_tokens" in usage_sink:
+            completion_response["usage"]["cache_creation_input_tokens"] = usage_sink[
+                "cache_creation_input_tokens"
+            ]
+        if "cache_read_input_tokens" in usage_sink:
+            completion_response["usage"]["cache_read_input_tokens"] = usage_sink[
+                "cache_read_input_tokens"
+            ]
         return JSONResponse(content=completion_response)
 
     async def sse_wrapper() -> typing.AsyncGenerator[bytes, None]:
         async for chunk in multiplexer.generate_stream(
             candidate_models=candidates,
             messages=payload_dict.get("messages", []),
+            session_id=session_id,
+            usage_sink=usage_sink,
             **extra_kwargs,
         ):
             openai_chunk = {
@@ -296,6 +348,8 @@ async def anthropic_messages(fastapi_req: Request, payload: AnthropicMessagesReq
     if "anthropic-beta" in fastapi_req.headers:
         extra_kwargs["anthropic_beta"] = fastapi_req.headers["anthropic-beta"]
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    session_id = extract_session_id(fastapi_req, payload.messages)
+    usage_sink: dict[str, typing.Any] = {}
 
     if payload.stream:
 
@@ -327,6 +381,8 @@ async def anthropic_messages(fastapi_req: Request, payload: AnthropicMessagesReq
             async for chunk in multiplexer.generate_stream(
                 candidate_models=candidates,
                 messages=payload_dict.get("messages", []),
+                session_id=session_id,
+                usage_sink=usage_sink,
                 **extra_kwargs,
             ):
                 if chunk:
@@ -342,11 +398,20 @@ async def anthropic_messages(fastapi_req: Request, payload: AnthropicMessagesReq
             content_block_stop = {"type": "content_block_stop", "index": 0}
             yield f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n".encode()
 
-            message_delta = {
+            out_toks = usage_sink.get("output_tokens") or max(1, total_output_tokens)
+            message_delta: dict[str, typing.Any] = {
                 "type": "message_delta",
                 "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": {"output_tokens": max(1, total_output_tokens)},
+                "usage": {"output_tokens": out_toks},
             }
+            if usage_sink.get("cache_creation_input_tokens") is not None:
+                message_delta["usage"]["cache_creation_input_tokens"] = usage_sink[
+                    "cache_creation_input_tokens"
+                ]
+            if usage_sink.get("cache_read_input_tokens") is not None:
+                message_delta["usage"]["cache_read_input_tokens"] = usage_sink[
+                    "cache_read_input_tokens"
+                ]
             yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n".encode()
 
             message_stop = {"type": "message_stop"}
@@ -362,12 +427,24 @@ async def anthropic_messages(fastapi_req: Request, payload: AnthropicMessagesReq
     async for chunk in multiplexer.generate_stream(
         candidate_models=candidates,
         messages=payload_dict.get("messages", []),
+        session_id=session_id,
+        usage_sink=usage_sink,
         **extra_kwargs,
     ):
         accumulated_content.append(chunk)
 
     full_text = "".join(accumulated_content)
-    total_output_tokens = max(1, len(full_text) // 4)
+    total_output_tokens = usage_sink.get("output_tokens") or max(1, len(full_text) // 4)
+    in_toks = usage_sink.get("input_tokens") or max(1, context_length)
+    resp_usage: dict[str, typing.Any] = {
+        "input_tokens": in_toks,
+        "output_tokens": total_output_tokens,
+    }
+    if usage_sink.get("cache_creation_input_tokens") is not None:
+        resp_usage["cache_creation_input_tokens"] = usage_sink["cache_creation_input_tokens"]
+    if usage_sink.get("cache_read_input_tokens") is not None:
+        resp_usage["cache_read_input_tokens"] = usage_sink["cache_read_input_tokens"]
+
     return JSONResponse(
         content={
             "id": msg_id,
@@ -377,10 +454,7 @@ async def anthropic_messages(fastapi_req: Request, payload: AnthropicMessagesReq
             "model": payload.model,
             "stop_reason": "end_turn",
             "stop_sequence": None,
-            "usage": {
-                "input_tokens": max(1, context_length),
-                "output_tokens": total_output_tokens,
-            },
+            "usage": resp_usage,
         }
     )
 

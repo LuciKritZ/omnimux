@@ -494,3 +494,246 @@ async def test_base_llm_client_get_client() -> None:
     async with client._get_client() as c:
         assert c is mock_http
     await mock_http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_has_cache_control_helper() -> None:
+    from omnimux.services.adapters import _has_cache_control
+
+    assert _has_cache_control({"cache_control": {"type": "ephemeral"}}) is True
+    assert _has_cache_control([{"nested": {"cache_control": {"type": "ephemeral"}}}]) is True
+    assert _has_cache_control({"text": "no cache control"}) is False
+    assert _has_cache_control("plain string") is False
+    assert _has_cache_control(None) is False
+
+
+@pytest.mark.asyncio
+async def test_anthropic_client_cache_control_and_usage(
+    anthropic_client: AnthropicClient,
+) -> None:
+    captured_request: dict[str, Any] = {}
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        async def mock_aiter_lines() -> AsyncGenerator[str, None]:
+            yield (
+                'data: {"type": "message_start", "message": {"usage": '
+                '{"input_tokens": 150, "cache_creation_input_tokens": 80, '
+                '"cache_read_input_tokens": 70}}}'
+            )
+            yield (
+                'data: {"type": "content_block_delta", '
+                '"delta": {"type": "text_delta", "text": "Cached response"}}'
+            )
+            yield 'data: {"type": "message_delta", "usage": {"output_tokens": 25}}'
+
+        mock_response.aiter_lines.return_value = mock_aiter_lines()
+
+        class AsyncContextManager:
+            async def __aenter__(self) -> MagicMock:
+                return mock_response
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+                pass
+
+        def side_effect(
+            method: str, url: str, headers: dict[str, str], json: dict[str, Any]
+        ) -> AsyncContextManager:
+            captured_request["method"] = method
+            captured_request["url"] = url
+            captured_request["headers"] = headers
+            captured_request["json"] = json
+            return AsyncContextManager()
+
+        mock_stream.side_effect = side_effect
+
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "System prompt with cache",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "User msg",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+        ]
+
+        chunks = []
+        usage_sink: dict[str, Any] = {}
+        async for chunk in anthropic_client.generate_stream(
+            model="claude-3-7-sonnet-20250219",
+            messages=messages,
+            anthropic_beta="interleaved-thinking-2025-02-19",
+            usage_sink=usage_sink,
+        ):
+            chunks.append(chunk)
+
+        assert "".join(chunks) == "Cached response"
+        assert usage_sink["cache_creation_input_tokens"] == 80
+        assert usage_sink["cache_read_input_tokens"] == 70
+        # Beta header appended
+        captured_headers: dict[str, str] = captured_request["headers"]
+        captured_json: dict[str, Any] = captured_request["json"]
+        assert "prompt-caching-2024-07-31" in captured_headers["anthropic-beta"]
+        assert "interleaved-thinking-2025-02-19" in captured_headers["anthropic-beta"]
+        # System was passed as list of dicts
+        assert isinstance(captured_json["system"], list)
+        assert captured_json["system"][0]["cache_control"] == {"type": "ephemeral"}
+        # Check usage recorded
+        assert anthropic_client.last_usage["cache_creation_input_tokens"] == 80
+        assert anthropic_client.last_usage["cache_read_input_tokens"] == 70
+        assert anthropic_client.last_usage["output_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_anthropic_client_cache_control_auto_inject_header_when_none(
+    anthropic_client: AnthropicClient,
+) -> None:
+    captured_request: dict[str, Any] = {}
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        async def mock_aiter_lines() -> AsyncGenerator[str, None]:
+            yield 'data: {"type": "content_block_delta", "delta": {"text": "ok"}}'
+
+        mock_response.aiter_lines.return_value = mock_aiter_lines()
+
+        class AsyncContextManager:
+            async def __aenter__(self) -> MagicMock:
+                return mock_response
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+                pass
+
+        def side_effect(
+            method: str, url: str, headers: dict[str, str], json: dict[str, Any]
+        ) -> AsyncContextManager:
+            captured_request["headers"] = headers
+            return AsyncContextManager()
+
+        mock_stream.side_effect = side_effect
+
+        messages = [
+            {
+                "role": "user",
+                "content": "hello",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+        async for _ in anthropic_client.generate_stream(
+            model="claude-3-7-sonnet",
+            messages=messages,
+        ):
+            pass
+
+        captured_headers: dict[str, str] = captured_request["headers"]
+        assert captured_headers["anthropic-beta"] == "prompt-caching-2024-07-31"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_client_system_kwargs_and_mixed_system(
+    anthropic_client: AnthropicClient,
+) -> None:
+    captured_payloads: list[dict[str, Any]] = []
+
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        async def mock_aiter_lines() -> AsyncGenerator[str, None]:
+            yield 'data: {"type": "content_block_delta", "delta": {"text": "ok"}}'
+
+        mock_response.aiter_lines.return_value = mock_aiter_lines()
+
+        class AsyncContextManager:
+            async def __aenter__(self) -> MagicMock:
+                return mock_response
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+                pass
+
+        def side_effect(
+            method: str, url: str, headers: dict[str, str], json: dict[str, Any]
+        ) -> AsyncContextManager:
+            captured_payloads.append(json)
+            return AsyncContextManager()
+
+        mock_stream.side_effect = side_effect
+
+        # 1. System passed via kwargs
+        async for _ in anthropic_client.generate_stream(
+            model="claude-3-7-sonnet",
+            messages=[{"role": "user", "content": "hi"}],
+            system="Explicit system instructions",
+        ):
+            pass
+        assert captured_payloads[0]["system"] == "Explicit system instructions"
+
+        # 2. System messages list then string, plus non-dict item in content list
+        mixed_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": [{"type": "text", "text": "Part 1"}, "raw-string-block"]},
+            {"role": "system", "content": "Part 2"},
+            {"role": "user", "content": "hello"},
+        ]
+        async for _ in anthropic_client.generate_stream(
+            model="claude-3-7-sonnet",
+            messages=mixed_messages,
+        ):
+            pass
+        assert isinstance(captured_payloads[1]["system"], list)
+        assert len(captured_payloads[1]["system"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_client_usage_stream(openai_client: OpenAICompatibleClient) -> None:
+    with patch("httpx.AsyncClient.stream") as mock_stream:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        async def mock_aiter_lines() -> AsyncGenerator[str, None]:
+            yield (
+                'data: {"choices": [{"delta": {"content": "Hello"}}], '
+                '"usage": {"prompt_tokens": 10, "completion_tokens": 5, '
+                '"prompt_tokens_details": {"cached_tokens": 8}}}'
+            )
+
+        mock_response.aiter_lines.return_value = mock_aiter_lines()
+
+        class AsyncContextManager:
+            async def __aenter__(self) -> MagicMock:
+                return mock_response
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+                pass
+
+        mock_stream.return_value = AsyncContextManager()
+
+        sink: dict[str, Any] = {}
+        async for chunk in openai_client.generate_stream(
+            "gpt-4o", [{"role": "user", "content": "hi"}], usage_sink=sink
+        ):
+            assert chunk == "Hello"
+
+        assert openai_client.last_usage["prompt_tokens"] == 10
+        assert openai_client.last_usage["completion_tokens"] == 5
+        assert openai_client.last_usage["prompt_tokens_details_cached_tokens"] == 8
+        assert sink["prompt_tokens"] == 10
+        assert sink["completion_tokens"] == 5
+        assert sink["prompt_tokens_details_cached_tokens"] == 8

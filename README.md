@@ -53,6 +53,7 @@ omnimux exposes standard OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/mes
 ## Core Features
 
 - 🔄 **Autonomous 429 Hot-Swapping**: Automatically cycles through backup API keys and provider fallbacks with intelligent backoff cooldowns when an upstream service rate-limits or fails.
+- 🎯 **Prompt Cache Affinity & Pass-Through**: Retains Anthropic `cache_control` metadata across system instructions and message blocks while pinning multi-turn agent sessions to the same upstream API key for a 5-minute TTL, maximizing prompt cache hits and cutting API costs by up to 90%.
 - 🦙 **Zero-OOM Ollama Engine**: Issues `keep_alive: 0` unloads for idle local models prior to spinning up fresh models, preventing out-of-memory crashes on unified-memory Apple Silicon and CUDA GPUs.
 - ⚡ **Dual Protocol Translation**: Complete bidirectional translation between Anthropic `/v1/messages` and OpenAI `/v1/chat/completions` with full SSE streaming and token count endpoints.
 - 🗜️ **Context Optimizer**: Converts bulky HTML pages from agent web searches into lean markdown and deduplicates multimodal vision images with local SHA-256 caching.
