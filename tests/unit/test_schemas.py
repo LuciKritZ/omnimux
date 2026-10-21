@@ -92,3 +92,73 @@ def test_convert_anthropic_preserves_tools_and_top_p() -> None:
     converted = convert_anthropic_to_chat_completion(req)
     assert getattr(converted, "tools", None) == tools
     assert getattr(converted, "top_p", None) == 0.9
+
+
+def test_convert_anthropic_preserves_cache_control() -> None:
+    req = AnthropicMessagesRequest(
+        model="claude-3-7-sonnet",
+        system=[
+            {"type": "text", "text": "System prompt", "cache_control": {"type": "ephemeral"}},
+            {"type": "other"},
+        ],
+        messages=[
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "text",
+                        "text": "Cached user turn",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "image",
+                        "source": {"media_type": "image/png", "data": "abc"},
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "calc",
+                        "input": {"x": 1},
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {
+                        "type": "tool_result",
+                        "content": "res",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+                cache_control={"type": "ephemeral"},
+            ),
+            AnthropicMessage(
+                role="assistant",
+                content="String message with cache control",
+                cache_control={"type": "ephemeral"},
+            ),
+        ],
+    )
+    converted = convert_anthropic_to_chat_completion(req)
+    assert len(converted.messages) == 3
+
+    # System message structured ContentBlocks with cache_control
+    sys_msg = converted.messages[0]
+    assert sys_msg.role == "system"
+    assert isinstance(sys_msg.content, list)
+    assert sys_msg.content[0].text == "System prompt"
+    assert sys_msg.content[0].cache_control == {"type": "ephemeral"}
+
+    # User message blocks
+    user_msg = converted.messages[1]
+    assert user_msg.role == "user"
+    assert user_msg.cache_control == {"type": "ephemeral"}
+    assert isinstance(user_msg.content, list)
+    assert len(user_msg.content) == 4
+    assert user_msg.content[0].cache_control == {"type": "ephemeral"}
+    assert user_msg.content[1].cache_control == {"type": "ephemeral"}
+    assert user_msg.content[2].cache_control == {"type": "ephemeral"}
+    assert user_msg.content[3].cache_control == {"type": "ephemeral"}
+
+    # Assistant message
+    asst_msg = converted.messages[2]
+    assert asst_msg.role == "assistant"
+    assert asst_msg.content == "String message with cache control"
+    assert asst_msg.cache_control == {"type": "ephemeral"}

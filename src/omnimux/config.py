@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     retry_jitter_min_ms: int = 50
     retry_jitter_max_ms: int = 250
     sse_keepalive_interval_seconds: float = 3.0
+    session_affinity_ttl_seconds: float = 300.0
 
 
 settings = Settings()

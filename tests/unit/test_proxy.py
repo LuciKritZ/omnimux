@@ -399,3 +399,118 @@ def test_anthropic_messages_streaming_with_keepalive(
         assert ": keepalive\n\n" in text
         assert "reasoning token" in text
         assert "event: message_stop" in text
+
+
+def test_extract_session_id_variants() -> None:
+    from omnimux.routes.proxy import extract_session_id
+
+    # 1. Header takes priority
+    scope_header = {
+        "type": "http",
+        "headers": [(b"x-session-id", b"custom-sess-123")],
+    }
+    req_header = Request(scope_header)
+    assert extract_session_id(req_header, []) == "custom-sess-123"
+
+    # 2. Conversation id header
+    scope_conv = {
+        "type": "http",
+        "headers": [(b"x-conversation-id", b"conv-456")],
+    }
+    assert extract_session_id(Request(scope_conv), []) == "conv-456"
+
+    # 3. Deterministic fallback with message
+    scope_none = {
+        "type": "http",
+        "headers": [(b"authorization", b"Bearer token123")],
+    }
+    sess_a = extract_session_id(Request(scope_none), [{"content": "initial system prompt"}])
+    sess_b = extract_session_id(Request(scope_none), [{"content": "initial system prompt"}])
+    assert sess_a.startswith("sess_")
+    assert sess_a == sess_b
+
+    # 4. Fallback with empty messages
+    sess_empty = extract_session_id(Request(scope_none), [])
+    assert sess_empty.startswith("sess_")
+
+    # 5. Fallback with primitive string message
+    sess_prim = extract_session_id(Request(scope_none), ["raw string turn"])
+    assert sess_prim.startswith("sess_")
+
+
+def test_proxy_chat_completions_cache_usage(test_client: TestClient) -> None:
+    with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
+
+        async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            usage_sink = kwargs.get("usage_sink")
+            if isinstance(usage_sink, dict):
+                usage_sink["cache_creation_input_tokens"] = 50
+                usage_sink["cache_read_input_tokens"] = 150
+            yield "Hello"
+
+        mock_stream.side_effect = mock_gen
+
+        res = test_client.post(
+            "/v1/chat/completions",
+            headers={"x-session-id": "test-chat-session"},
+            json={
+                "model": "auto",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+            },
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["usage"]["cache_creation_input_tokens"] == 50
+        assert data["usage"]["cache_read_input_tokens"] == 150
+
+
+def test_proxy_anthropic_messages_cache_usage_streaming_and_non_streaming(
+    test_client: TestClient,
+) -> None:
+    with patch("omnimux.services.multiplexer.Multiplexer.generate_stream") as mock_stream:
+
+        async def mock_gen(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            usage_sink = kwargs.get("usage_sink")
+            if isinstance(usage_sink, dict):
+                usage_sink["cache_creation_input_tokens"] = 25
+                usage_sink["cache_read_input_tokens"] = 75
+            yield "Anthropic chunk"
+
+        mock_stream.side_effect = mock_gen
+
+        # 1. Non-streaming
+        res_non_stream = test_client.post(
+            "/v1/messages",
+            headers={"anthropic-session-id": "test-anthropic-session"},
+            json={
+                "model": "claude-3-7-sonnet-20250219",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": False,
+            },
+        )
+        assert res_non_stream.status_code == 200
+        data = res_non_stream.json()
+        assert data["usage"]["cache_creation_input_tokens"] == 25
+        assert data["usage"]["cache_read_input_tokens"] == 75
+
+        # 2. Streaming
+        res_stream = test_client.post(
+            "/v1/messages",
+            headers={"anthropic-session-id": "test-anthropic-session"},
+            json={
+                "model": "claude-3-7-sonnet-20250219",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+        assert res_stream.status_code == 200
+        text = res_stream.text
+        assert "event: message_delta" in text
+        lines = [
+            line
+            for line in text.split("\n")
+            if (line.startswith("data: ") and "message_delta" in line)
+            or ("cache_read_input_tokens" in line)
+        ]
+        assert any("cache_read_input_tokens" in line for line in lines)

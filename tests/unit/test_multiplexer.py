@@ -618,3 +618,107 @@ async def test_multiplexer_aborts_immediately_on_syntax_400(
 
     assert mock_router.get_best_platform_and_key.call_count == 1
     mock_router.mark_key_exhausted.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_forwards_session_id_and_populates_usage_sink(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    mock_router.get_best_platform_and_key.return_value = (
+        "anthropic",
+        {"key_hash": "h1", "key_value": "v1"},
+    )
+
+    mock_client = MagicMock()
+    mock_client.generate_stream.return_value = MockStreamGen(["streamed", "tokens"])
+    mock_client.last_usage = {
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 200,
+    }
+    mock_get_client.return_value = mock_client
+
+    multiplexer = Multiplexer(mock_router, enable_jitter=False)
+    usage_sink: dict[str, Any] = {}
+    chunks = [
+        c
+        async for c in multiplexer.generate_stream(
+            ["anthropic/claude-3-7-sonnet"],
+            [],
+            session_id="my-session-id",
+            usage_sink=usage_sink,
+        )
+    ]
+
+    assert chunks == ["streamed", "tokens"]
+    mock_router.get_best_platform_and_key.assert_called_once_with(
+        ["anthropic"], session_id="my-session-id"
+    )
+    assert usage_sink["cache_creation_input_tokens"] == 100
+    assert usage_sink["cache_read_input_tokens"] == 200
+
+
+@pytest.mark.asyncio
+@patch("omnimux.services.multiplexer.get_client_for_platform")
+async def test_multiplexer_system_fallback_and_final_fallback_with_usage_sink(
+    mock_get_client: MagicMock, mock_router: MagicMock
+) -> None:
+    # 1. candidate_models[0] == "system_fallback" with usage_sink
+    mock_ollama_client = MagicMock()
+    mock_ollama_client.generate_stream.return_value = MockStreamGen(["fallback_chunk"])
+    mock_ollama_client.last_usage = {"input_tokens": 12, "output_tokens": 4}
+    mock_get_client.return_value = mock_ollama_client
+
+    multiplexer = Multiplexer(mock_router, enable_jitter=False)
+    usage_sink: dict[str, Any] = {}
+    chunks = [
+        c
+        async for c in multiplexer.generate_stream(
+            ["system_fallback"],
+            [],
+            usage_sink=usage_sink,
+        )
+    ]
+    assert chunks == ["fallback_chunk"]
+    assert usage_sink["input_tokens"] == 12
+
+    # 2. Empty stream raising StopAsyncIteration on first chunk with usage_sink
+    mock_router.get_best_platform_and_key.return_value = (
+        "anthropic",
+        {"key_hash": "h1", "key_value": "v1"},
+    )
+    empty_client = MagicMock()
+    empty_client.generate_stream.return_value = MockStreamGen([])
+    empty_client.last_usage = {"input_tokens": 5}
+    mock_get_client.return_value = empty_client
+
+    usage_sink_empty: dict[str, Any] = {}
+    chunks_empty = [
+        c
+        async for c in multiplexer.generate_stream(
+            ["anthropic/claude-3-7-sonnet"],
+            [],
+            usage_sink=usage_sink_empty,
+        )
+    ]
+    assert chunks_empty == []
+    assert usage_sink_empty["input_tokens"] == 5
+
+    # 3. Final fallback to ollama when attempts exhausted with usage_sink
+    mock_router.get_best_platform_and_key.side_effect = NoKeysAvailableError("none")
+    final_ollama = MagicMock()
+    final_ollama.generate_stream.return_value = MockStreamGen(["final_fallback"])
+    final_ollama.last_usage = {"output_tokens": 8}
+    mock_get_client.return_value = final_ollama
+
+    usage_sink_final: dict[str, Any] = {}
+    chunks_final = [
+        c
+        async for c in multiplexer.generate_stream(
+            ["anthropic/claude-3-7-sonnet"],
+            [],
+            usage_sink=usage_sink_final,
+        )
+    ]
+    assert chunks_final == ["final_fallback"]
+    assert usage_sink_final["output_tokens"] == 8

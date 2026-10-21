@@ -30,6 +30,41 @@ class RouterCore:
         self._rr_index: dict[str, int] = {}
         # Cached concurrency limit per key
         self._key_concurrency_limits: dict[str, int] = {}
+        # Session affinity cache: session_id -> (platform, key_hash, expires_at)
+        self._session_affinity: dict[str, tuple[str, str, float]] = {}
+
+    def get_session_affinity(self, session_id: str) -> tuple[str, str, float] | None:
+        """Retrieves active session affinity if not expired."""
+        if session_id not in self._session_affinity:
+            return None
+        platform, key_hash, expires_at = self._session_affinity[session_id]
+        now = datetime.datetime.now(datetime.UTC).timestamp()
+        if now > expires_at:
+            self._session_affinity.pop(session_id, None)
+            return None
+        return platform, key_hash, expires_at
+
+    def set_session_affinity(
+        self,
+        session_id: str,
+        platform: str,
+        key_hash: str,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        """Binds a session to a specific platform and key_hash with TTL."""
+        ttl = ttl_seconds if ttl_seconds is not None else settings.session_affinity_ttl_seconds
+        now = datetime.datetime.now(datetime.UTC).timestamp()
+        self._session_affinity[session_id] = (platform, key_hash, now + ttl)
+
+    def evict_session_affinity(self, session_id: str) -> None:
+        """Evicts a specific session affinity."""
+        self._session_affinity.pop(session_id, None)
+
+    def evict_affinities_for_key(self, key_hash: str) -> None:
+        """Evicts all session affinities bound to a specific key_hash."""
+        expired = [s for s, (_, kh, _) in self._session_affinity.items() if kh == key_hash]
+        for s in expired:
+            self._session_affinity.pop(s, None)
 
     def get_key_concurrency_limit(self, key_hash: str, meta: Any = None) -> int:
         """Determines the maximum concurrency limit for a key from meta or settings."""
@@ -73,10 +108,10 @@ class RouterCore:
         effective_limit = limit if limit is not None else self.get_key_concurrency_limit(key_hash)
         return self.get_in_flight_count(key_hash) >= effective_limit
 
-    async def get_next_key(self, platform: str) -> dict[str, Any]:
+    async def get_next_key(self, platform: str, session_id: str | None = None) -> dict[str, Any]:
         """
         Retrieves the best available key for a given platform.
-        Prioritizes highest `priority`, then round-robin / least-loaded balancing.
+        Prioritizes session affinity, then highest `priority`, then round-robin / least-loaded.
         Skips keys currently in cooldown (try_after).
         """
         now = datetime.datetime.now(datetime.UTC).timestamp()
@@ -122,6 +157,25 @@ class RouterCore:
                 f"All keys for {platform} are currently exhausted or in cooldown."
             )
 
+        if session_id:
+            affinity = self.get_session_affinity(session_id)
+            if affinity:
+                aff_platform, aff_key_hash, _ = affinity
+                bound_row = next(
+                    (r for r in valid_rows if aff_platform == platform and r[0] == aff_key_hash),
+                    None,
+                )
+                if bound_row:
+                    self.set_session_affinity(session_id, platform, aff_key_hash)
+                    return {
+                        "key_hash": bound_row[0],
+                        "key_value": bound_row[1],
+                        "priority": bound_row[2],
+                        "meta": bound_row[5],
+                    }
+                else:
+                    self.evict_session_affinity(session_id)
+
         rr_offset = self._rr_index.get(platform, 0)
 
         # Pass 1: select from idle keys (in_flight == 0)
@@ -134,6 +188,8 @@ class RouterCore:
             same_ts = [r for r in best_idle if (r[4] or "") == oldest_ts]
             selected = same_ts[rr_offset % len(same_ts)]
             self._rr_index[platform] = rr_offset + 1
+            if session_id:
+                self.set_session_affinity(session_id, platform, selected[0])
             return {
                 "key_hash": selected[0],
                 "key_value": selected[1],
@@ -157,6 +213,8 @@ class RouterCore:
         same_load_ts = [r for r in min_load_candidates if (r[4] or "") == oldest_ts]
         selected = same_load_ts[rr_offset % len(same_load_ts)]
         self._rr_index[platform] = rr_offset + 1
+        if session_id:
+            self.set_session_affinity(session_id, platform, selected[0])
 
         return {
             "key_hash": selected[0],
@@ -178,11 +236,12 @@ class RouterCore:
                 await self.mark_key_used(key_hash)
 
     async def get_best_platform_and_key(
-        self, candidate_platforms: list[str]
+        self, candidate_platforms: list[str], session_id: str | None = None
     ) -> tuple[str, dict[str, Any]]:
         """
         Retrieves the best available platform and key from a list of candidates.
-        Prioritizes highest `priority`, caller order, least in-flight load, and round-robin.
+        Prioritizes session affinity, then highest `priority`, caller order, least in-flight load,
+        and round-robin.
         """
         now_dt = datetime.datetime.now(datetime.UTC)
         now = now_dt.timestamp()
@@ -232,6 +291,29 @@ class RouterCore:
                 f"All keys for candidate platforms {candidate_platforms} are in cooldown."
             )
 
+        if session_id:
+            affinity = self.get_session_affinity(session_id)
+            if affinity:
+                aff_platform, aff_key_hash, _ = affinity
+                bound_row = next(
+                    (r for r in valid_rows if r[0] == aff_platform and r[1] == aff_key_hash),
+                    None,
+                )
+                if bound_row:
+                    self.set_session_affinity(session_id, aff_platform, aff_key_hash)
+                    await self.db.execute(
+                        "UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?",
+                        (now_dt.isoformat(), aff_key_hash),
+                    )
+                    await self.db.commit()
+                    return aff_platform, {
+                        "key_hash": bound_row[1],
+                        "key_value": bound_row[2],
+                        "meta": bound_row[6],
+                    }
+                else:
+                    self.evict_session_affinity(session_id)
+
         platform_order = {p: i for i, p in enumerate(candidate_platforms)}
 
         # Pass 1: idle keys (in_flight == 0)
@@ -256,6 +338,9 @@ class RouterCore:
                 (now_dt.isoformat(), selected[1]),
             )
             await self.db.commit()
+
+            if session_id:
+                self.set_session_affinity(session_id, selected[0], selected[1])
 
             return selected[0], {
                 "key_hash": selected[1],
@@ -295,6 +380,9 @@ class RouterCore:
         )
         await self.db.commit()
 
+        if session_id:
+            self.set_session_affinity(session_id, selected[0], selected[1])
+
         return selected[0], {
             "key_hash": selected[1],
             "key_value": selected[2],
@@ -302,10 +390,11 @@ class RouterCore:
         }
 
     async def mark_key_exhausted(self, key_hash: str, duration_seconds: float) -> None:
-        """Puts a key in cooldown for a specified duration."""
+        """Puts a key in cooldown for a specified duration and evicts any session affinities."""
         now = datetime.datetime.now(datetime.UTC)
         try_after = now + datetime.timedelta(seconds=duration_seconds)
         self._cooldowns[key_hash] = try_after.timestamp()
+        self.evict_affinities_for_key(key_hash)
 
         await self.db.execute(
             "UPDATE api_keys SET try_after = ? WHERE key_hash = ?",
